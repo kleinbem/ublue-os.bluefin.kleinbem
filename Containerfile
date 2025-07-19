@@ -4,7 +4,7 @@ COPY build_files /
 
 # Base Image
 # Universal Blue Images: https://github.com/orgs/ublue-os/packages
-FROM ghcr.io/ublue-os/bluefin-dx:latest 
+FROM ghcr.io/ublue-os/bluefin-dx-hwe:latest 
 
 ### MODIFICATIONS
 ## make modifications desired in your image and install packages by modifying the build.sh script
