@@ -4,7 +4,6 @@ set -euxo pipefail
 echo "Starting build_kernel_modules.sh - Checking and potentially building kernel modules."
 
 # --- Configuration ---
-# Define modules to be checked and built.
 REQUIRED_MODULES=(
     "binder_linux"
     "ashmem_linux"
@@ -106,9 +105,9 @@ for i in "${!ANBOX_SOURCE_DIRS[@]}"; do
     cp -rT "${SOURCE_DIR}" "${MODULE_PATH}"
     TEMP_SRC_DIRS+=("${MODULE_PATH}")
 
-    # Explicitly call build first, then install (without --kernel on install)
-    dkms build "${DKMS_NAME}/${DKMS_VERSION}" --kernel "${TARGET_KERNEL_VERSION}" --arch x86_64
-    dkms install "${DKMS_NAME}/${DKMS_VERSION}" # Removed --kernel here
+    # REMOVED --kernel "${TARGET_KERNEL_VERSION}" from dkms build
+    dkms build "${DKMS_NAME}/${DKMS_VERSION}" --arch x86_64
+    dkms install "${DKMS_NAME}/${DKMS_VERSION}" # No --kernel here either
 done
 echo "All specified kernel modules built and installed via DKMS."
 
