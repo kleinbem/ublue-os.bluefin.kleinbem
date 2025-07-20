@@ -1,7 +1,7 @@
 # Stage 1: Context for all build-related files (scripts, configs, etc.)
-# Copy the entire contents of your local 'build_files' directory into /ctx_data/ in this stage.
 FROM scratch AS ctx
-COPY build_files /ctx_data/ # Correct source path: 'build_files' is relative to local repo root
+# Copy the entire contents of your local 'build_files' directory into /ctx_data/ in this stage.
+COPY build_files /ctx_data/
 
 
 # -------------------------------------------------------------
