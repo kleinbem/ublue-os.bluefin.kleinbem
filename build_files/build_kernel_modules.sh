@@ -30,7 +30,7 @@ DKMS_MODULE_VERSIONS=(
     "1"
 )
 
-# Common build dependencies for kernel modules (re-including skopeo and jq)
+# Common build dependencies for kernel modules (including skopeo and jq)
 COMMON_BUILD_DEPS=(
     git
     make
@@ -45,9 +45,9 @@ UBLUE_AKMODS_IMAGE="ghcr.io/ublue-os/akmods"
 
 # **CRITICAL:** Hardcode a known-good, *generic* Fedora 42 kernel tag from the akmods list.
 # This kernel-devel will be used for compilation, hoping it's ABI-compatible with TARGET_KERNEL_VERSION.
-# Based on your 'skopeo list-tags' output, pick the *latest* 'main-42-X.Y.Z-300.fc42.x86_64' tag.
-# As of your provided list, "main-42-6.15.6-200.fc42.x86_64" is one of the highest generic F42 kernels.
-AKMODS_TAG_FOR_KERNEL_DEVEL="main-42-6.15.6-200.fc42.x86_64" # <-- CONFIRM THIS IS THE LATEST GENERIC F42 KERNEL IN THE AKMODS LIST!
+# Based on your 'skopeo list-tags' output, "main-42-6.15.6-200.fc42.x86_64" is one of the highest generic F42 kernels.
+# CONFIRM THIS IS THE LATEST GENERIC F42 KERNEL IN THE AKMODS LIST from your side!
+AKMODS_TAG_FOR_KERNEL_DEVEL="main-42-6.15.6-200.fc42.x86_64" 
 
 ANBOX_MODULES_REPO_URL="https://github.com/choff/anbox-modules.git"
 # IMPORTANT: It's HIGHLY recommended to specify a commit hash here.
@@ -112,22 +112,43 @@ echo "Fetching and installing specific kernel-devel RPM using skopeo for AKMODS_
 KERNEL_RPM_DIR="/tmp/akmods_kernel_rpms"
 mkdir -p "${KERNEL_RPM_DIR}"
 
+echo "Pulling UBlue AKMODS image: ${UBLUE_AKMODS_IMAGE}:${AKMODS_TAG_FOR_KERNEL_DEVEL}"
 skopeo copy --retry-times 3 "docker://${UBLUE_AKMODS_IMAGE}:${AKMODS_TAG_FOR_KERNEL_DEVEL}" "dir:${KERNEL_RPM_DIR}"
 
-# Extract the RPMs (especially kernel-devel)
+echo "Extracting RPMs from pulled AKMODS content..."
 AKMODS_TARGZ_DIGEST=$(jq -r '.layers[].digest' <"${KERNEL_RPM_DIR}/manifest.json" | cut -d : -f 2)
 tar -xvzf "${KERNEL_RPM_DIR}/${AKMODS_TARGZ_DIGEST}" -C "${KERNEL_RPM_DIR}"/
 
+# >>> CRITICAL FIX: Move contents of kernel-rpms/ and rpms/ to the root of KERNEL_RPM_DIR <<<
+echo "Moving extracted RPMs to top level of ${KERNEL_RPM_DIR}..."
+if [ -d "${KERNEL_RPM_DIR}/kernel-rpms" ]; then
+    mv "${KERNEL_RPM_DIR}/kernel-rpms"/* "${KERNEL_RPM_DIR}/"
+fi
 if [ -d "${KERNEL_RPM_DIR}/rpms" ]; then
     mv "${KERNEL_RPM_DIR}/rpms"/* "${KERNEL_RPM_DIR}/"
 fi
+rmdir "${KERNEL_RPM_DIR}/kernel-rpms" || true # Clean up empty dir
+rmdir "${KERNEL_RPM_DIR}/rpms" || true       # Clean up empty dir
+echo "RPMs moved."
+
 
 # Determine the kernel version from the AKMODS tag to install the specific devel package
 # Example: "main-42-6.15.6-200.fc42.x86_64" -> "6.15.6-200.fc42.x86_64"
-KERNEL_VERSION_FROM_AKMODS_TAG=$(echo "${AKMODS_TAG_FOR_KERNEL_DEVEL}" | sed -E 's/^(main|coreos-stable|bazzite|surface|longterm)-[0-9]+-(.*)$/\2/')
+# This sed command needs to be robust for all possible tag prefixes.
+KERNEL_VERSION_FROM_AKMODS_TAG=$(echo "${AKMODS_TAG_FOR_KERNEL_DEVEL}" | sed -E 's/^(main|coreos-stable|bazzite|surface|longterm|coreos-testing)-[0-9]+-(.*)$/\2/')
+echo "Inferred KERNEL_VERSION_FROM_AKMODS_TAG: ${KERNEL_VERSION_FROM_AKMODS_TAG}"
+
 
 # Install the specific kernel-devel RPM
 echo "Installing kernel-devel RPM: ${KERNEL_RPM_DIR}/kernel-devel-${KERNEL_VERSION_FROM_AKMODS_TAG}.rpm"
+# Check if the file actually exists before attempting to install
+if [ ! -f "${KERNEL_RPM_DIR}/kernel-devel-${KERNEL_VERSION_FROM_AKMODS_TAG}.rpm" ]; then
+    echo "CRITICAL ERROR: kernel-devel RPM not found at expected path after extraction: ${KERNEL_RPM_DIR}/kernel-devel-${KERNEL_VERSION_FROM_AKMODS_TAG}.rpm"
+    echo "This indicates an issue with skopeo pull or tar extraction. Contents of ${KERNEL_RPM_DIR}:"
+    ls -l "${KERNEL_RPM_DIR}" || true
+    exit 1
+fi
+
 dnf5 install -y "${KERNEL_RPM_DIR}/kernel-devel-${KERNEL_VERSION_FROM_AKMODS_TAG}.rpm"
 echo "Specific kernel-devel RPM for AKMODS_TAG installed."
 
