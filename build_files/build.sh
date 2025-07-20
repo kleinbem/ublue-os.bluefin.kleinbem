@@ -2,6 +2,9 @@
 
 set -ouex pipefail
 
+### Install mofules
+/ctx/build_kernel_modules.sh
+
 ### Install packages
 
 # Packages can be installed from any enabled yum repo on the image.
@@ -11,6 +14,8 @@ set -ouex pipefail
 
 # this installs a package from fedora repos
 dnf5 install -y tmux 
+
+dnf5 install -y waydroid lxc
 
 # Use a COPR Example:
 #
@@ -22,3 +27,5 @@ dnf5 install -y tmux
 #### Example for enabling a System Unit File
 
 systemctl enable podman.socket
+
+rpm-ostree cleanup -m
