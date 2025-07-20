@@ -21,17 +21,17 @@ DKMS_MODULE_VERSIONS=(
     "1"
 )
 
-# Common build dependencies for kernel modules
+# Common build dependencies for kernel modules (excluding kernel-headers/devel which are from base)
 COMMON_BUILD_DEPS=(
     git
     make
     gcc
     dkms
-    # Add any other universally required build dependencies
+    # Add any other universally required build dependencies here (e.g., flex, bison, libelf-devel)
 )
 
 ANBOX_MODULES_REPO_URL="https://github.com/choff/anbox-modules.git"
-ANBOX_MODULES_REPO_COMMIT="" # Leave empty if you want to use the default branch (e.g., 'main')
+ANBOX_MODULES_REPO_COMMIT="" # Or your specific commit hash
 
 # --- Functions ---
 
@@ -45,48 +45,47 @@ check_modules_present() {
             echo "  - ${module} module found."
         fi
     done
-    echo "${modules_missing}" # Return true/false
+    echo "${modules_missing}"
 }
 
 install_temp_build_deps() {
     echo "Installing temporary build dependencies for kernel modules..."
-    dnf5 install -y "${COMMON_BUILD_DEPS[@]}" \
-        "kernel-headers-${TARGET_KERNEL_VERSION}" \
-        "kernel-devel-${TARGET_KERNEL_VERSION}"
+    # Only install general build tools, as kernel-headers/devel are from the base image
+    dnf5 install -y "${COMMON_BUILD_DEPS[@]}"
     echo "Temporary build dependencies installed."
 }
 
 remove_temp_build_deps() {
     echo "Cleaning up temporary build dependencies..."
-    dnf5 remove -y "${COMMON_BUILD_DEPS[@]}" \
-        "kernel-headers-${TARGET_KERNEL_VERSION}" \
-        "kernel-devel-${TARGET_KERNEL_VERSION}" \
-        || true # `|| true` to prevent script failure if a package isn't found
+    # Only remove general build tools
+    dnf5 remove -y "${COMMON_BUILD_DEPS[@]}" || true
     echo "Temporary build dependencies cleaned up."
 }
 
 # --- Main Logic ---
 
-# Check if all required modules are already present
+# 0. Check if all required modules are already present
 echo "Checking if all required kernel modules are already available..."
 MODULES_STILL_MISSING=$(check_modules_present)
 
 if [ "${MODULES_STILL_MISSING}" = "false" ]; then
     echo "All required kernel modules are already present. Skipping module build process."
     echo "build_kernel_modules.sh finished (skipped)."
-    exit 0 # Exit successfully if modules are already there
+    exit 0
 fi
 
 echo "One or more kernel modules are missing. Proceeding with full module build."
 
-# Determine the exact kernel version of the base image
+# 1. Determine the exact kernel version of the base image
+# This will be the kernel from the bluefin-dx-hwe base image,
+# and its headers/devel packages are already present in the build environment.
 TARGET_KERNEL_VERSION=$(uname -r)
 echo "Target Kernel Version detected: ${TARGET_KERNEL_VERSION}"
 
-# Temporarily install build tools and kernel headers
+# 2. Temporarily install general build tools (kernel headers/devel are already there)
 install_temp_build_deps
 
-# Clone Kernel Modules source
+# 3. Clone Kernel Modules source
 echo "Cloning Anbox kernel modules source from ${ANBOX_MODULES_REPO_URL}..."
 ANBOX_MODULES_REPO_DIR="/tmp/anbox-modules-repo"
 git clone --depth 1 "${ANBOX_MODULES_REPO_URL}" "${ANBOX_MODULES_REPO_DIR}"
@@ -97,9 +96,9 @@ if [ -n "${ANBOX_MODULES_REPO_COMMIT}" ]; then
     git checkout "${ANBOX_MODULES_REPO_COMMIT}"
 fi
 
-# Copy module sources to /usr/src/ and use dkms to build and install
+# 4. Copy module sources to /usr/src/ and use dkms to build and install
 echo "Copying module sources to /usr/src/ and building/installing with DKMS..."
-TEMP_SRC_DIRS=() # Keep track of temporary /usr/src directories for cleanup
+TEMP_SRC_DIRS=()
 
 for i in "${!ANBOX_SOURCE_DIRS[@]}"; do
     SOURCE_DIR="${ANBOX_SOURCE_DIRS[$i]}"
@@ -109,27 +108,27 @@ for i in "${!ANBOX_SOURCE_DIRS[@]}"; do
 
     echo "  - Processing ${SOURCE_DIR} (DKMS: ${DKMS_NAME}/${DKMS_VERSION})..."
     cp -rT "${SOURCE_DIR}" "${MODULE_PATH}"
-    TEMP_SRC_DIRS+=("${MODULE_PATH}") # Add to list for cleanup
+    TEMP_SRC_DIRS+=("${MODULE_PATH}")
 
     dkms install "${DKMS_NAME}/${DKMS_VERSION}" --kernel "${TARGET_KERNEL_VERSION}" --arch x86_64
 done
 echo "All specified kernel modules built and installed via DKMS."
 
-# Update kernel module dependencies
+# 5. Update kernel module dependencies
 echo "Running depmod -a..."
 depmod -a "${TARGET_KERNEL_VERSION}"
 echo "depmod complete."
 
-# Install configuration files (assuming these are shared for all Anbox modules)
+# 6. Install configuration files (specific to Anbox)
 echo "Installing Anbox configuration files..."
 cp anbox.conf /etc/modules-load.d/
 cp 99-anbox.rules /lib/udev/rules.d/
 echo "Anbox configuration files installed."
 
-# Cleanup temporary build dependencies
+# 7. Cleanup temporary build dependencies
 remove_temp_build_deps
 
-# Clean up source directories
+# 8. Clean up source directories
 echo "Cleaning up source directories..."
 rm -rf "${ANBOX_MODULES_REPO_DIR}"
 for dir in "${TEMP_SRC_DIRS[@]}"; do
