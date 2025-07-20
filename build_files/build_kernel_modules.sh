@@ -1,181 +1,142 @@
 #!/bin/bash
 set -euxo pipefail # Strict error checking, unbound variables, echoing commands
 
-echo "Starting build_kernel_modules.sh - Checking and potentially building kernel modules."
+echo "Starting build_kernel_modules.sh - Performing all kernel module extraction and setup."
 
-# -------------------------------------------------------------
-# 1. Determine the exact kernel version of the base image (MUST BE FIRST)
-#    This will now correctly report a standard Fedora kernel like 6.15.6-200.fc42.x86_64
-# -------------------------------------------------------------
-TARGET_KERNEL_VERSION=$(uname -r)
-echo "Target Kernel Version detected: ${TARGET_KERNEL_VERSION}"
-
-
-# --- Configuration ---
+# --- Configuration (for Waydroid and extraction) ---
 REQUIRED_MODULES=(
     "binder_linux"
     "ashmem_linux"
 )
-ANBOX_SOURCE_DIRS=(
-    "binder"
-    "ashmem"
-)
-DKMS_MODULE_NAMES=(
-    "anbox-binder"
-    "anbox-ashmem"
-)
-DKMS_MODULE_VERSIONS=(
-    "1"
-    "1"
-)
+ANBOX_MODULES_REPO_URL="https://github.com/choff/anbox-modules.git" # For config files
+ANBOX_MODULES_REPO_COMMIT="" # Or your specific compatible commit hash for Linux 6.15.x
 
-# Common build dependencies for kernel modules.
-# kernel-devel will be installed via rpm-ostree from standard repos.
-COMMON_BUILD_DEPS=(
-    git
-    make
-    gcc
-    dkms
-    "kernel-devel-${TARGET_KERNEL_VERSION}" # This package *should* now be found in standard repos
-)
+UBLUE_AKMODS_IMAGE="ghcr.io/ublue-os/akmods"
 
-ANBOX_MODULES_REPO_URL="https://github.com/choff/anbox-modules.git"
-# IMPORTANT: Highly recommended to specify a compatible commit hash for Linux 6.15.x or newer.
-# Check choff/anbox-modules GitHub for a commit known to work with Linux 6.15.x.
-# Example: ANBOX_MODULES_REPO_COMMIT="a1b2c3d4e5f6..." # REPLACE with actual commit
-ANBOX_MODULES_REPO_COMMIT=""
+# Hardcode a known-good Bazzite kernel version for extraction.
+# This will be used to pull the correct akmods image.
+# Example from your previous skopeo list-tags output.
+BAZZITE_KERNEL_VERSION_FOR_EXTRACTION="6.15.6-103.bazzite.fc42.x86_64"
+BAZZITE_FEDORA_VERSION_FOR_EXTRACTION="42" # From fc42 in the kernel version
+AKMODS_TAG_FOR_BAZZITE="bazzite-${BAZZITE_FEDORA_VERSION_FOR_EXTRACTION}-${BAZZITE_KERNEL_VERSION_FOR_EXTRACTION}"
 
 
 # --- Functions ---
 
 check_modules_present() {
     local modules_missing=false
-    for module in "${REQUIRED_MODULES[@]}"; do
-        if ! modprobe -n "${module}" &>/dev/null; then
-            echo "  - ${module} module not found."
-            modules_missing=true
-        else
-            echo "  - ${module} module found."
-        fi
-    done
+    local current_running_kernel=$(uname -r)
+    echo "  (Internal) Current running kernel for modprobe check: ${current_running_kernel}"
+
+    if ! modprobe -n binder_linux &>/dev/null; then
+        echo "  - binder_linux module not found."
+        modules_missing=true
+    else
+        echo "  - binder_linux module found."
+    fi
+
+    if ! modprobe -n ashmem_linux &>/dev/null; then
+        echo "  - ashmem_linux module not found."
+        modules_missing=true
+    else
+        echo "  - ashmem_linux module found."
+    fi
     echo "${modules_missing}"
-}
-
-install_temp_build_deps() {
-    echo "Installing temporary build dependencies for kernel modules..."
-    # Using rpm-ostree install for all build deps. This should now succeed for kernel-devel.
-    rpm-ostree install --apply-live --allow-inactive "${COMMON_BUILD_DEPS[@]}"
-    echo "Temporary build dependencies installed."
-}
-
-remove_temp_build_deps() {
-    echo "Cleaning up temporary build dependencies..."
-    rpm-ostree override remove "${COMMON_BUILD_DEPS[@]}" || true
-    echo "Temporary build dependencies cleaned up."
 }
 
 # --- Main Logic ---
 
-# 0. Check if all required modules are already present
-echo "Checking if all required kernel modules are already available..."
+# 0. Check if all required modules are already present (on the bluefin-dx kernel)
+echo "Checking if all required kernel modules are already available on current system..."
 MODULES_STILL_MISSING=$(check_modules_present)
 
 if [ "${MODULES_STILL_MISSING}" = "false" ]; then
-    echo "All required kernel modules are present. Skipping module build process."
+    echo "All required kernel modules are present. Skipping module build/copy process."
     echo "build_kernel_modules.sh finished (skipped)."
     exit 0
 fi
 
-echo "One or more kernel modules are missing. Proceeding with full module build."
+echo "One or more kernel modules are missing. Proceeding with module extraction and installation."
 
-# Define the kernel source directory where kernel-devel installs headers
-KERNEL_SOURCE_DIR="/usr/src/kernels/${TARGET_KERNEL_VERSION}"
-echo "DKMS will use kernel source directory: ${KERNEL_SOURCE_DIR}"
+# -------------------------------------------------------------
+# 1. Install temporary tools needed for extraction
+# -------------------------------------------------------------
+echo "Installing temporary tools: skopeo, jq, tar, gzip, rpm-build..."
+dnf5 install -y skopeo jq tar gzip rpm-build
+echo "Temporary tools installed."
 
-# 2. Temporarily install general build tools AND kernel-devel from standard repos
-install_temp_build_deps
+# -------------------------------------------------------------
+# 2. Extract .ko files from Bazzite AKMODS image
+# -------------------------------------------------------------
+echo "Fetching Bazzite AKMODS image: ${UBLUE_AKMODS_IMAGE}:${AKMODS_TAG_FOR_BAZZITE}"
+KERNEL_RPM_DIR="/tmp/bazzite_akmods_content"
+mkdir -p "${KERNEL_RPM_DIR}"
 
-# >>> Verify kernel source directory *after* installation <<<
-echo "Verifying kernel source directory contents AFTER kernel-devel installation:"
-ls -l "${KERNEL_SOURCE_DIR}" || true
-if [ ! -d "${KERNEL_SOURCE_DIR}" ] || [ -z "$(ls -A "${KERNEL_SOURCE_DIR}")" ]; then
-    echo "CRITICAL ERROR: Kernel source directory ${KERNEL_SOURCE_DIR} is still empty or does NOT exist after attempting installation!"
-    echo "This indicates that 'kernel-devel-${TARGET_KERNEL_VERSION}' package was not successfully installed or did not populate headers."
-    echo "Cannot proceed with module compilation."
-    exit 1 # Exit with error, as this is unrecoverable without headers
-fi
+skopeo copy --retry-times 3 "docker://${UBLUE_AKMODS_IMAGE}:${AKMODS_TAG_FOR_BAZZITE}" "dir:${KERNEL_RPM_DIR}" \
+    || (echo "CRITICAL ERROR: Failed to pull AKMODS image ${UBLUE_AKMODS_IMAGE}:${AKMODS_TAG_FOR_BAZZITE}. Cannot proceed with module extraction." && exit 1)
 
-# >>> Create the expected DKMS symlink <<<
-echo "Creating /lib/modules/${TARGET_KERNEL_VERSION}/build symlink for DKMS..."
-mkdir -p /lib/modules/"${TARGET_KERNEL_VERSION}"/
-ln -sfn "${KERNEL_SOURCE_DIR}" /lib/modules/"${TARGET_KERNEL_VERSION}"/build
-echo "Symlink created. Verifying symlink target:"
-ls -l /lib/modules/"${TARGET_KERNEL_VERSION}"/build
+echo "Extracting RPMs from pulled AKMODS content..."
+AKMODS_TARGZ_DIGEST=$(jq -r '.layers[].digest' <"${KERNEL_RPM_DIR}/manifest.json" | cut -d : -f 2)
+tar -xvzf "${KERNEL_RPM_DIR}/${AKMODS_TARGZ_DIGEST}" -C "${KERNEL_RPM_DIR}"/
 
+# Move the rpms/kmods/* content to a central location for processing
+echo "Moving extracted kmod RPMs for processing..."
+EXTRACTED_RPMS_DIR="${KERNEL_RPM_DIR}/extracted_rpms"
+mkdir -p "${EXTRACTED_RPMS_DIR}"
+find "${KERNEL_RPM_DIR}/rpms/kmods/" -name "*.rpm" -exec mv {} "${EXTRACTED_RPMS_DIR}/" \; \
+    || (echo "Warning: No kmod RPMs found in ${KERNEL_RPM_DIR}/rpms/kmods/" || true)
+echo "kmod RPMs moved."
 
-# 3. Clone Anbox Kernel Modules source
-echo "Cloning Anbox kernel modules source from ${ANBOX_MODULES_REPO_URL}..."
-ANBOX_MODULES_REPO_DIR="/tmp/anbox-modules-repo"
-git clone --depth 1 "${ANBOX_MODULES_REPO_URL}" "${ANBOX_MODULES_REPO_DIR}"
-cd "${ANBOX_MODULES_REPO_DIR}"
+# Now, extract the .ko files from these kmod RPMs using rpm2cpio
+# Modules should be extracted to /usr/lib/modules/<kernel_version>/extra/
+# We need to manually set the target path for cpio or copy after extraction.
+# We will extract to a temporary location and then copy specific .ko files.
+TEMP_KO_EXTRACT_DIR="/tmp/temp_ko_extract"
+mkdir -p "${TEMP_KO_EXTRACT_DIR}"
 
-if [ -n "${ANBOX_MODULES_REPO_COMMIT}" ]; then
-    echo "Checking out specific commit: ${ANBOX_MODULES_REPO_COMMIT}"
-    git checkout "${ANBOX_MODULES_REPO_COMMIT}"
-fi
-
-# 4. Copy module sources to /usr/src/ and use dkms to build and install
-echo "Copying module sources to /usr/src/ and building/installing with DKMS..."
-TEMP_SRC_DIRS=()
-
-for i in "${!ANBOX_SOURCE_DIRS[@]}"; do
-    SOURCE_DIR="${ANBOX_SOURCE_DIRS[$i]}"
-    DKMS_NAME="${DKMS_MODULE_NAMES[$i]}"
-    DKMS_VERSION="${DKMS_MODULE_VERSIONS[$i]}"
-    MODULE_PATH="/usr/src/${DKMS_NAME}-${DKMS_VERSION}"
-
-    echo "  - Processing ${SOURCE_DIR} (DKMS: ${DKMS_NAME}/${DKMS_VERSION})..."
-    cp -rT "${SOURCE_DIR}" "${MODULE_PATH}"
-    TEMP_SRC_DIRS+=("${MODULE_PATH}")
-
-    echo "Attempting DKMS build for ${DKMS_NAME}/${DKMS_VERSION} (verbose output follows)..."
-    # Build with --kernelsourcedir pointing to the *installed* kernel-devel headers
-    dkms build "${DKMS_NAME}/${DKMS_VERSION}" --kernelsourcedir "${KERNEL_SOURCE_DIR}" --arch x86_64 --verbose
-    
-    BUILD_LOG_PATH="/var/lib/dkms/${DKMS_NAME}/${DKMS_VERSION}/build/make.log"
-    if [ -f "${BUILD_LOG_PATH}" ]; then
-        echo "DKMS build log for ${DKMS_NAME} at ${BUILD_LOG_PATH}:"
-        cat "${BUILD_LOG_PATH}"
-    else
-        echo "DKMS build log not found at ${BUILD_LOG_PATH}."
-    fi
-    
-    echo "Attempting DKMS install for ${DKMS_NAME}/${DKMS_VERSION}..."
-    dkms install "${DKMS_NAME}/${DKMS_VERSION}"
-
+echo "Extracting .ko files from kmod RPMs using rpm2cpio..."
+for rpm in "${EXTRACTED_RPMS_DIR}"/*.rpm; do
+    echo "  - Processing RPM: $(basename "$rpm")"
+    rpm2cpio "$rpm" | cpio -idmv --quiet -D "${TEMP_KO_EXTRACT_DIR}" \
+    || (echo "Warning: Failed to extract modules from $(basename "$rpm")." || true)
 done
-echo "All specified kernel modules built and installed via DKMS."
+echo ".ko files extracted to temporary directory."
 
-# 5. Update kernel module dependencies
+# -------------------------------------------------------------
+# 3. Copy the extracted .ko files and config files to final /usr/lib/modules/ location
+# -------------------------------------------------------------
+TARGET_RUNNING_KERNEL_VERSION=$(uname -r) # Get the actual running kernel of the Bluefin image
+MODULE_FINAL_DEST_DIR="/usr/lib/modules/${TARGET_RUNNING_KERNEL_VERSION}/extra"
+mkdir -p "${MODULE_FINAL_DEST_DIR}"
+
+echo "Copying extracted .ko files to final destination: ${MODULE_FINAL_DEST_DIR}..."
+cp "${TEMP_KO_EXTRACT_DIR}/usr/lib/modules/${BAZZITE_KERNEL_VERSION_FOR_EXTRACTION}/extra/ashmem_linux.ko" "${MODULE_FINAL_DEST_DIR}/" \
+    || (echo "ERROR: Failed to copy ashmem_linux.ko to final location!" && exit 1)
+cp "${TEMP_KO_EXTRACT_DIR}/usr/lib/modules/${BAZZITE_KERNEL_VERSION_FOR_EXTRACTION}/extra/binder_linux.ko" "${MODULE_FINAL_DEST_DIR}/" \
+    || (echo "ERROR: Failed to copy binder_linux.ko to final location!" && exit 1)
+echo ".ko files copied."
+
+# Copy Anbox configuration files (from /ctx/build_files/ where Containerfile copied them)
+echo "Copying Anbox configuration files..."
+cp /ctx/build_files/anbox.conf /etc/modules-load.d/anbox.conf \
+    || (echo "ERROR: Failed to copy anbox.conf!" && exit 1)
+cp /ctx/build_files/99-anbox.rules /lib/udev/rules.d/99-anbox.rules \
+    || (echo "ERROR: Failed to copy 99-anbox.rules!" && exit 1)
+echo "Config files copied."
+
+# -------------------------------------------------------------
+# 4. Update kernel module dependencies
+# -------------------------------------------------------------
 echo "Running depmod -a..."
-depmod -a "${TARGET_KERNEL_VERSION}"
+depmod -a "${TARGET_RUNNING_KERNEL_VERSION}"
 echo "depmod complete."
 
-# 6. Install configuration files (specific to Anbox)
-echo "Installing Anbox configuration files..."
-cp anbox.conf /etc/modules-load.d/
-cp 99-anbox.rules /lib/udev/rules.d/
-echo "Anbox configuration files installed."
+# -------------------------------------------------------------
+# 5. Cleanup temporary tools and extracted content
+# -------------------------------------------------------------
+echo "Cleaning up temporary files and tools..."
+dnf5 remove -y skopeo jq tar gzip rpm-build || true
+rm -rf "${KERNEL_RPM_DIR}" "${TEMP_KO_EXTRACT_DIR}"
+echo "Cleanup complete."
 
-# 7. Cleanup temporary build dependencies
-remove_temp_deps
-
-# 8. Clean up source directories
-echo "Cleaning up source directories..."
-rm -rf "${ANBOX_MODULES_REPO_DIR}"
-for dir in "${TEMP_SRC_DIRS[@]}"; do
-    rm -rf "${dir}"
-done
-echo "Source directories cleaned up."
-
-echo "build_kernel_modules.sh finished (completed build)."
+echo "build_kernel_modules.sh finished (completed module extraction and installation)."
