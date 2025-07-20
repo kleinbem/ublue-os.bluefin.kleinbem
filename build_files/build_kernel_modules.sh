@@ -1,11 +1,10 @@
 #!/bin/bash
-set -euxo pipefail # Strict error checking, unbound variables, echoing commands
+set -euxo pipefail
 
 echo "Starting build_kernel_modules.sh - Checking and potentially building kernel modules."
 
 # -------------------------------------------------------------
 # 1. Determine the exact kernel version of the base image (MUST BE FIRST)
-#    This will now be a standard Fedora kernel (e.g., 6.14.x-300.fc42.x86_64)
 # -------------------------------------------------------------
 TARGET_KERNEL_VERSION=$(uname -r)
 echo "Target Kernel Version detected: ${TARGET_KERNEL_VERSION}"
@@ -29,15 +28,22 @@ DKMS_MODULE_VERSIONS=(
     "1"
 )
 
-# Common build dependencies for kernel modules
-# kernel-devel is now installed via rpm-ostree from standard repos.
+# Common build dependencies for kernel modules (re-including skopeo and jq)
 COMMON_BUILD_DEPS=(
     git
     make
     gcc
     dkms
-    "kernel-devel-${TARGET_KERNEL_VERSION}" # This package *will* now be found in standard repos
+    skopeo # <-- Need skopeo to pull the akmods image
+    jq     # <-- Need jq to parse manifest.json
 )
+
+# Universal Blue's AKMODS image for fetching kernel-devel
+UBLUE_AKMODS_IMAGE="ghcr.io/ublue-os/akmods"
+# **CRITICAL:** Hardcode a known-good, *generic* Fedora 42 kernel tag from the akmods list.
+# This kernel-devel will be used for compilation, hoping it's ABI-compatible with TARGET_KERNEL_VERSION.
+# Pick the highest 'main-42' kernel from your 'skopeo list-tags' output.
+AKMODS_TAG_FOR_KERNEL_DEVEL="main-42-6.15.6-200.fc42.x86_64" # <-- Adjust this to the *absolute latest* 'main-42' kernel tag you see.
 
 ANBOX_MODULES_REPO_URL="https://github.com/choff/anbox-modules.git"
 ANBOX_MODULES_REPO_COMMIT="" # Or your specific compatible commit hash for this kernel
@@ -58,16 +64,18 @@ check_modules_present() {
 }
 
 install_temp_build_deps() {
-    echo "Installing temporary build dependencies for kernel modules..."
-    # Using rpm-ostree install for all build deps, including kernel-devel
+    echo "Installing temporary build dependencies for kernel modules (including skopeo and jq)..."
     rpm-ostree install --apply-live --allow-inactive "${COMMON_BUILD_DEPS[@]}"
     echo "Temporary build dependencies installed."
 }
 
 remove_temp_build_deps() {
     echo "Cleaning up temporary build dependencies..."
-    # Removing all build deps, including kernel-devel
-    rpm-ostree override remove "${COMMON_BUILD_DEPS[@]}" || true
+    # We will remove COMMON_BUILD_DEPS and also the specific kernel-devel package
+    # for the kernel we pulled.
+    rpm-ostree override remove "${COMMON_BUILD_DEPS[@]}" \
+        "kernel-devel-${KERNEL_VERSION_FROM_AKMODS_TAG}" \
+        || true
     echo "Temporary build dependencies cleaned up."
 }
 
@@ -85,20 +93,48 @@ fi
 
 echo "One or more kernel modules are missing. Proceeding with full module build."
 
-# KERNEL_SOURCE_DIR definition
-KERNEL_SOURCE_DIR="/usr/src/kernels/${TARGET_KERNEL_VERSION}"
+# KERNEL_SOURCE_DIR definition will be based on the kernel-devel we *pull and install*
+KERNEL_SOURCE_DIR_FOR_BUILD="" # This will be set after installing the devel RPM
+
+# 2. Temporarily install general build tools (NOW INCLUDING SKOPEO & JQ)
+install_temp_build_deps
+
+# 2a. Fetch and Install a specific kernel-devel RPM from UBlue's akmods
+echo "Fetching and installing specific kernel-devel RPM using skopeo for AKMODS_TAG: ${AKMODS_TAG_FOR_KERNEL_DEVEL}..."
+KERNEL_RPM_DIR="/tmp/akmods_kernel_rpms"
+mkdir -p "${KERNEL_RPM_DIR}"
+
+skopeo copy --retry-times 3 "docker://${UBLUE_AKMODS_IMAGE}:${AKMODS_TAG_FOR_KERNEL_DEVEL}" "dir:${KERNEL_RPM_DIR}"
+
+# Extract the RPMs (especially kernel-devel)
+AKMODS_TARGZ_DIGEST=$(jq -r '.layers[].digest' <"${KERNEL_RPM_DIR}/manifest.json" | cut -d : -f 2)
+tar -xvzf "${KERNEL_RPM_DIR}/${AKMODS_TARGZ_DIGEST}" -C "${KERNEL_RPM_DIR}"/
+
+if [ -d "${KERNEL_RPM_DIR}/rpms" ]; then
+    mv "${KERNEL_RPM_DIR}/rpms"/* "${KERNEL_RPM_DIR}/"
+fi
+
+# Determine the kernel version from the AKMODS tag to install the specific devel package
+# Example: "main-42-6.15.6-200.fc42.x86_64" -> "6.15.6-200.fc42.x86_64"
+# This might need adjustment depending on the exact AKMODS_TAG_FOR_KERNEL_DEVEL format
+KERNEL_VERSION_FROM_AKMODS_TAG=$(echo "${AKMODS_TAG_FOR_KERNEL_DEVEL}" | sed -E 's/^(main|coreos-stable|bazzite|surface)-[0-9]+-(.*)$/\2/')
+
+# Install the specific kernel-devel RPM
+echo "Installing kernel-devel RPM: ${KERNEL_RPM_DIR}/kernel-devel-${KERNEL_VERSION_FROM_AKMODS_TAG}.rpm"
+dnf5 install -y "${KERNEL_RPM_DIR}/kernel-devel-${KERNEL_VERSION_FROM_AKMODS_TAG}.rpm"
+echo "Specific kernel-devel RPM for AKMODS_TAG installed."
+
+# Set the KERNEL_SOURCE_DIR for DKMS build to match the installed devel package
+KERNEL_SOURCE_DIR="/usr/src/kernels/${KERNEL_VERSION_FROM_AKMODS_TAG}"
 echo "DKMS will use kernel source directory: ${KERNEL_SOURCE_DIR}"
 
-
-# 2. Temporarily install general build tools AND kernel-devel from standard repos
-install_temp_build_deps
 
 # >>> Verify kernel source directory *after* installation <<<
 echo "Verifying kernel source directory contents AFTER kernel-devel installation:"
 ls -l "${KERNEL_SOURCE_DIR}" || true
 if [ ! -d "${KERNEL_SOURCE_DIR}" ] || [ -z "$(ls -A "${KERNEL_SOURCE_DIR}")" ]; then
     echo "CRITICAL ERROR: Kernel source directory ${KERNEL_SOURCE_DIR} is still empty or does NOT exist after attempting installation!"
-    echo "This indicates a fundamental issue with kernel-devel package. Cannot proceed."
+    echo "This indicates a fundamental issue with kernel-devel package extraction. Cannot proceed."
     exit 1 # Exit with error, as this is unrecoverable without headers
 fi
 
@@ -136,6 +172,8 @@ for i in "${!ANBOX_SOURCE_DIRS[@]}"; do
     TEMP_SRC_DIRS+=("${MODULE_PATH}")
 
     echo "Attempting DKMS build for ${DKMS_NAME}/${DKMS_VERSION} (verbose output follows)..."
+    # Build with --kernelsourcedir pointing to the *pulled* kernel-devel headers
+    # and --arch x86_64 for clarity.
     dkms build "${DKMS_NAME}/${DKMS_VERSION}" --kernelsourcedir "${KERNEL_SOURCE_DIR}" --arch x86_64 --verbose
     
     BUILD_LOG_PATH="/var/lib/dkms/${DKMS_NAME}/${DKMS_VERSION}/build/make.log"
@@ -147,6 +185,7 @@ for i in "${!ANBOX_SOURCE_DIRS[@]}"; do
     fi
     
     echo "Attempting DKMS install for ${DKMS_NAME}/${DKMS_VERSION}..."
+    # Install for the TARGET_KERNEL_VERSION (the running kernel)
     dkms install "${DKMS_NAME}/${DKMS_VERSION}"
 
 done
@@ -172,6 +211,7 @@ rm -rf "${ANBOX_MODULES_REPO_DIR}"
 for dir in "${TEMP_SRC_DIRS[@]}"; do
     rm -rf "${dir}"
 done
+rm -rf "${KERNEL_RPM_DIR}" # Clean up the pulled akmods content
 echo "Source directories cleaned up."
 
 echo "build_kernel_modules.sh finished (completed build)."
