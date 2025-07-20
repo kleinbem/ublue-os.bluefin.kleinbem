@@ -4,12 +4,16 @@ set -euxo pipefail # Strict error checking, unbound variables, echoing commands
 echo "Starting build_kernel_modules.sh - Checking and potentially building kernel modules."
 
 # -------------------------------------------------------------
-# 1. Determine the exact kernel version of the base image
-#    This should consistently report a standard Fedora kernel (e.g., 6.15.6-200.fc42.x86_64)
+# 1. HARDCODED TARGET KERNEL VERSION FOR COMPILATION
+#    We are explicitly setting this to a known-good Fedora kernel version.
+#    This bypasses the potentially misleading 'uname -r' output in the build environment.
+#    This is your *actual* kernel version you confirmed: 6.15.6-200.fc42.x86_64
 # -------------------------------------------------------------
-TARGET_KERNEL_VERSION=$(uname -r)
-echo "Target Kernel Version detected: ${TARGET_KERNEL_VERSION}"
+TARGET_KERNEL_VERSION="6.15.6-200.fc42.x86_64" # <-- HARDCODED TO YOUR CONFIRMED KERNEL
+echo "Hardcoded Target Kernel Version for Compilation: ${TARGET_KERNEL_VERSION}"
 
+# For module loading later, we still need the actual running kernel, but that's handled implicitly by dkms install.
+# We'll use this TARGET_KERNEL_VERSION for installing kernel-devel and for DKMS's --kernelsourcedir.
 
 # --- Configuration ---
 REQUIRED_MODULES=(
@@ -30,7 +34,7 @@ DKMS_MODULE_VERSIONS=(
 )
 
 # Common build dependencies for kernel modules.
-# kernel-devel will be installed via rpm-ostree from standard repos.
+# skopeo and jq are NOT needed as we are not pulling kernel-devel from akmods here.
 COMMON_BUILD_DEPS=(
     git
     make
@@ -40,8 +44,8 @@ COMMON_BUILD_DEPS=(
 )
 
 ANBOX_MODULES_REPO_URL="https://github.com/choff/anbox-modules.git"
-# IMPORTANT: Highly recommended to specify a compatible commit hash for Linux 6.15.x or newer.
-# Check choff/anbox-modules GitHub for a commit known to work with your specific kernel version.
+# IMPORTANT: Highly recommended to specify a compatible commit hash for Linux 6.15.x.
+# Check choff/anbox-modules GitHub for a commit known to work with Linux 6.15.x.
 # Example: ANBOX_MODULES_REPO_COMMIT="a1b2c3d4e5f6..." # REPLACE with actual commit
 ANBOX_MODULES_REPO_COMMIT=""
 
@@ -49,21 +53,31 @@ ANBOX_MODULES_REPO_COMMIT=""
 # --- Functions ---
 
 check_modules_present() {
+    # This check is still against the *running* kernel, which might be different from TARGET_KERNEL_VERSION.
+    # It just determines if we need to build at all.
     local modules_missing=false
-    for module in "${REQUIRED_MODULES[@]}"; do
-        if ! modprobe -n "${module}" &>/dev/null; then
-            echo "  - ${module} module not found."
-            modules_missing=true
-        else
-            echo "  - ${module} module found."
-        fi
-    done
+    local current_running_kernel=$(uname -r)
+    echo "  (Internal) Current running kernel for modprobe check: ${current_running_kernel}"
+
+    if ! modprobe -n binder_linux &>/dev/null; then
+        echo "  - binder_linux module not found."
+        modules_missing=true
+    else
+        echo "  - binder_linux module found."
+    fi
+
+    if ! modprobe -n ashmem_linux &>/dev/null; then
+        echo "  - ashmem_linux module not found."
+        modules_missing=true
+    else
+        echo "  - ashmem_linux module found."
+    fi
     echo "${modules_missing}"
 }
 
 install_temp_build_deps() {
-    echo "Installing temporary build dependencies for kernel modules..."
-    # Using rpm-ostree install for all build deps. This should now succeed for kernel-devel.
+    echo "Installing temporary build dependencies for kernel modules (including kernel-devel-${TARGET_KERNEL_VERSION})..."
+    # Using rpm-ostree install for all build deps. This should now succeed.
     rpm-ostree install --apply-live --allow-inactive "${COMMON_BUILD_DEPS[@]}"
     echo "Temporary build dependencies installed."
 }
@@ -89,7 +103,7 @@ fi
 echo "One or more kernel modules are missing. Proceeding with full module build."
 
 # Define the kernel source directory where kernel-devel installs headers
-KERNEL_SOURCE_DIR="/usr/src/kernels/${TARGET_KERNEL_VERSION}"
+KERNEL_SOURCE_DIR="/usr/src/kernels/${TARGET_KERNEL_VERSION}" # Uses the HARDCODED version
 echo "DKMS will use kernel source directory: ${KERNEL_SOURCE_DIR}"
 
 # 2. Temporarily install general build tools AND kernel-devel from standard repos
@@ -100,17 +114,18 @@ echo "Verifying kernel source directory contents AFTER kernel-devel installation
 ls -l "${KERNEL_SOURCE_DIR}" || true
 if [ ! -d "${KERNEL_SOURCE_DIR}" ] || [ -z "$(ls -A "${KERNEL_SOURCE_DIR}")" ]; then
     echo "CRITICAL ERROR: Kernel source directory ${KERNEL_SOURCE_DIR} is still empty or does NOT exist after attempting installation!"
-    echo "This indicates that 'kernel-devel-${TARGET_KERNEL_VERSION}' package was not successfully installed or did not populate headers."
+    echo "This indicates that 'kernel-devel-${TARGET_KERNEL_VERSION}' package was not successfully installed or did not populate headers as expected."
     echo "Cannot proceed with module compilation."
     exit 1 # Exit with error, as this is unrecoverable without headers
 fi
 
 # >>> Create the expected DKMS symlink <<<
-echo "Creating /lib/modules/${TARGET_KERNEL_VERSION}/build symlink for DKMS..."
-mkdir -p /lib/modules/"${TARGET_KERNEL_VERSION}"/
-ln -sfn "${KERNEL_SOURCE_DIR}" /lib/modules/"${TARGET_KERNEL_VERSION}"/build
+echo "Creating /lib/modules/$(uname -r)/build symlink for DKMS..."
+# Note: This symlink is for the *running kernel* but points to the *hardcoded compilation kernel's* headers.
+mkdir -p /lib/modules/"$(uname -r)"/
+ln -sfn "${KERNEL_SOURCE_DIR}" /lib/modules/"$(uname -r)"/build
 echo "Symlink created. Verifying symlink target:"
-ls -l /lib/modules/"${TARGET_KERNEL_VERSION}"/build
+ls -l /lib/modules/"$(uname -r)"/build
 
 
 # 3. Clone Anbox Kernel Modules source
@@ -139,7 +154,7 @@ for i in "${!ANBOX_SOURCE_DIRS[@]}"; do
     TEMP_SRC_DIRS+=("${MODULE_PATH}")
 
     echo "Attempting DKMS build for ${DKMS_NAME}/${DKMS_VERSION} (verbose output follows)..."
-    # Build with --kernelsourcedir pointing to the *installed* kernel-devel headers
+    # Build with --kernelsourcedir pointing to the *hardcoded* kernel-devel headers
     dkms build "${DKMS_NAME}/${DKMS_VERSION}" --kernelsourcedir "${KERNEL_SOURCE_DIR}" --arch x86_64 --verbose
     
     BUILD_LOG_PATH="/var/lib/dkms/${DKMS_NAME}/${DKMS_VERSION}/build/make.log"
@@ -151,6 +166,7 @@ for i in "${!ANBOX_SOURCE_DIRS[@]}"; do
     fi
     
     echo "Attempting DKMS install for ${DKMS_NAME}/${DKMS_VERSION}..."
+    # Install for the *currently running kernel* (uname -r)
     dkms install "${DKMS_NAME}/${DKMS_VERSION}"
 
 done
@@ -158,7 +174,8 @@ echo "All specified kernel modules built and installed via DKMS."
 
 # 5. Update kernel module dependencies
 echo "Running depmod -a..."
-depmod -a "${TARGET_KERNEL_VERSION}"
+# Use the running kernel version for depmod
+depmod -a "$(uname -r)"
 echo "depmod complete."
 
 # 6. Install configuration files (specific to Anbox)
