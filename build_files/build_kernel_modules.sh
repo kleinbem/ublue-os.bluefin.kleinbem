@@ -1,5 +1,5 @@
 #!/bin/bash
-set -euxo pipefail # Keep -euxo for strict error checking and echoing commands
+set -euxo pipefail
 
 echo "Starting build_kernel_modules.sh - Checking and potentially building kernel modules."
 
@@ -21,12 +21,14 @@ DKMS_MODULE_VERSIONS=(
     "1"
 )
 
+# Common build dependencies for kernel modules (re-including kernel-devel)
 COMMON_BUILD_DEPS=(
     git
     make
     gcc
     dkms
     # Add any other universally required build dependencies here (e.g., flex, bison, libelf-devel)
+    "kernel-devel-${TARGET_KERNEL_VERSION}" # <-- RE-ADDING THIS HERE
 )
 
 ANBOX_MODULES_REPO_URL="https://github.com/choff/anbox-modules.git"
@@ -49,13 +51,16 @@ check_modules_present() {
 
 install_temp_build_deps() {
     echo "Installing temporary build dependencies for kernel modules..."
-    dnf5 install -y "${COMMON_BUILD_DEPS[@]}"
+    # Use rpm-ostree install - it's designed for layering and can fix state
+    # Added --force to ensure it truly re-installs if needed.
+    rpm-ostree install --apply-live --allow-inactive --force "${COMMON_BUILD_DEPS[@]}"
     echo "Temporary build dependencies installed."
 }
 
 remove_temp_build_deps() {
     echo "Cleaning up temporary build dependencies..."
-    dnf5 remove -y "${COMMON_BUILD_DEPS[@]}" || true
+    # Use rpm-ostree override remove for clean removal of layered packages
+    rpm-ostree override remove "${COMMON_BUILD_DEPS[@]}" || true
     echo "Temporary build dependencies cleaned up."
 }
 
@@ -81,22 +86,25 @@ echo "Target Kernel Version detected: ${TARGET_KERNEL_VERSION}"
 KERNEL_SOURCE_DIR="/usr/src/kernels/${TARGET_KERNEL_VERSION}"
 echo "DKMS will use kernel source directory: ${KERNEL_SOURCE_DIR}"
 
-# 2. Temporarily install general build tools
+# 2. Temporarily install general build tools AND kernel-devel
+# This time using rpm-ostree install with force.
 install_temp_build_deps
 
-# >>> NEW STEP: Create the expected DKMS symlink <<<
+# >>> Verify kernel source directory *again* after installation <<<
+echo "Verifying kernel source directory contents AFTER forced install:"
+ls -l "${KERNEL_SOURCE_DIR}" || true
+if [ ! -d "${KERNEL_SOURCE_DIR}" ] || [ -z "$(ls -A "${KERNEL_SOURCE_DIR}")" ]; then
+    echo "CRITICAL ERROR: Kernel source directory ${KERNEL_SOURCE_DIR} is still empty or does NOT exist after attempting installation!"
+    echo "This indicates a fundamental issue with kernel-devel package or base image. Cannot proceed."
+    exit 1 # Exit with error, as this is unrecoverable without headers
+fi
+
+# >>> Create the expected DKMS symlink (still needed if kernel-devel doesn't do it) <<<
 echo "Creating /lib/modules/${TARGET_KERNEL_VERSION}/build symlink for DKMS..."
 mkdir -p /lib/modules/"${TARGET_KERNEL_VERSION}"/
 ln -sfn "${KERNEL_SOURCE_DIR}" /lib/modules/"${TARGET_KERNEL_VERSION}"/build
 echo "Symlink created. Verifying symlink target:"
-ls -l /lib/modules/"${TARGET_KERNEL_VERSION}"/build || true # Show symlink details
-echo "Verifying kernel source directory contents:"
-ls -l "${KERNEL_SOURCE_DIR}" || true # Show contents of the target directory
-if [ ! -d "${KERNEL_SOURCE_DIR}" ]; then
-    echo "CRITICAL ERROR: Kernel source directory ${KERNEL_SOURCE_DIR} does NOT exist after kernel-devel should have installed it!"
-    # You might want to exit here, or try to debug why kernel-devel didn't populate it.
-    # For now, we'll let it proceed to see the DKMS error.
-fi
+ls -l /lib/modules/"${TARGET_KERNEL_VERSION}"/build
 
 
 # 3. Clone Kernel Modules source
@@ -124,12 +132,9 @@ for i in "${!ANBOX_SOURCE_DIRS[@]}"; do
     cp -rT "${SOURCE_DIR}" "${MODULE_PATH}"
     TEMP_SRC_DIRS+=("${MODULE_PATH}")
 
-    # Build using --kernelsourcedir and --verbose
-    # The --verbose flag should print more details from the make process.
     echo "Attempting DKMS build for ${DKMS_NAME}/${DKMS_VERSION} (verbose output follows)..."
     dkms build "${DKMS_NAME}/${DKMS_VERSION}" --kernelsourcedir "${KERNEL_SOURCE_DIR}" --arch x86_64 --verbose
     
-    # Check if build log exists for more details
     BUILD_LOG_PATH="/var/lib/dkms/${DKMS_NAME}/${DKMS_VERSION}/build/make.log"
     if [ -f "${BUILD_LOG_PATH}" ]; then
         echo "DKMS build log for ${DKMS_NAME} at ${BUILD_LOG_PATH}:"
