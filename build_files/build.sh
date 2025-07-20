@@ -21,7 +21,8 @@ echo "--- DEBUG INFO END (from main build.sh) ---"
 # It will internally decide if a build is needed.
 # -------------------------------------------------------------
 echo "Calling build_kernel_modules.sh..."
-# Note: Path is now /ctx/build_files/build_kernel_modules.sh due to new COPY setup
+# >>> FIX: Updated path to build_kernel_modules.sh <<<
+# It's now at /ctx/build_files/build_kernel_modules.sh due to the Containerfile's COPY --from=ctx /ctx_data /ctx/build_files
 /ctx/build_files/build_kernel_modules.sh
 echo "build_kernel_modules.sh finished."
 
