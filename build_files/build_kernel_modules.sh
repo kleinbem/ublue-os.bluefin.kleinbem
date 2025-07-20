@@ -4,6 +4,7 @@ set -euxo pipefail
 echo "Starting build_kernel_modules.sh - Checking and potentially building kernel modules."
 
 # --- Configuration ---
+# Define modules to be checked and built.
 REQUIRED_MODULES=(
     "binder_linux"
     "ashmem_linux"
@@ -21,7 +22,6 @@ DKMS_MODULE_VERSIONS=(
     "1"
 )
 
-# Common build dependencies for kernel modules (excluding kernel-headers/devel which are from base)
 COMMON_BUILD_DEPS=(
     git
     make
@@ -50,14 +50,12 @@ check_modules_present() {
 
 install_temp_build_deps() {
     echo "Installing temporary build dependencies for kernel modules..."
-    # Only install general build tools, as kernel-headers/devel are from the base image
     dnf5 install -y "${COMMON_BUILD_DEPS[@]}"
     echo "Temporary build dependencies installed."
 }
 
 remove_temp_build_deps() {
     echo "Cleaning up temporary build dependencies..."
-    # Only remove general build tools
     dnf5 remove -y "${COMMON_BUILD_DEPS[@]}" || true
     echo "Temporary build dependencies cleaned up."
 }
@@ -77,8 +75,6 @@ fi
 echo "One or more kernel modules are missing. Proceeding with full module build."
 
 # 1. Determine the exact kernel version of the base image
-# This will be the kernel from the bluefin-dx-hwe base image,
-# and its headers/devel packages are already present in the build environment.
 TARGET_KERNEL_VERSION=$(uname -r)
 echo "Target Kernel Version detected: ${TARGET_KERNEL_VERSION}"
 
@@ -110,7 +106,9 @@ for i in "${!ANBOX_SOURCE_DIRS[@]}"; do
     cp -rT "${SOURCE_DIR}" "${MODULE_PATH}"
     TEMP_SRC_DIRS+=("${MODULE_PATH}")
 
-    dkms install "${DKMS_NAME}/${DKMS_VERSION}" --kernel "${TARGET_KERNEL_VERSION}" --arch x86_64
+    # Explicitly call build first, then install (without --kernel on install)
+    dkms build "${DKMS_NAME}/${DKMS_VERSION}" --kernel "${TARGET_KERNEL_VERSION}" --arch x86_64
+    dkms install "${DKMS_NAME}/${DKMS_VERSION}" # Removed --kernel here
 done
 echo "All specified kernel modules built and installed via DKMS."
 
