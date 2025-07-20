@@ -1,28 +1,29 @@
-# Stage 1: Context for build scripts (always at the top for clarity and common mounts)
+# Stage 1: Context for build scripts (always at the top)
 FROM scratch AS ctx
 COPY build_files /
 
 # -------------------------------------------------------------
-# Stage 2: Bazzite Base for Kernel Version & Module Paths
-#          This stage is used to determine the *exact* kernel version Bazzite:latest is using
-#          and to locate where Waydroid modules (if .ko files) are.
+# Stage 2: Bazzite Base for Kernel Version & Initial Module Path Check
+#          This stage determines the *exact* kernel version Bazzite:latest is using
+#          and attempts to find .ko files and config files directly from its base.
 # -------------------------------------------------------------
 FROM ghcr.io/ublue-os/bazzite:latest AS bazzite_kernel_info
 
 # Determine Bazzite's kernel version and save it to a file
-# This is crucial for retrieving the correct AKMODS later.
-# We also want to find the exact paths of binder_linux.ko and ashmem_linux.ko
-# if they exist as separate files in this base.
 RUN BAZZITE_KERNEL_VERSION=$(uname -r) && echo "${BAZZITE_KERNEL_VERSION}" > /tmp/bazzite_kernel_version.txt
-RUN find /usr/lib/modules/ -name "binder_linux.ko" -print -quit > /tmp/binder_ko_path.txt || true
-RUN find /usr/lib/modules/ -name "ashmem_linux.ko" -print -quit > /tmp/ashmem_ko_path.txt || true
+
+# Attempt to find pre-existing .ko files and config files directly in Bazzite base.
+# Use || true to prevent stage failure if files aren't found.
+# These will be copied to /tmp/<filename> if found.
+RUN find /usr/lib/modules/ -name "binder_linux.ko" -exec cp {} /tmp/binder_linux.ko \; || true
+RUN find /usr/lib/modules/ -name "ashmem_linux.ko" -exec cp {} /tmp/ashmem_linux.ko \; || true
 RUN cp /etc/modules-load.d/anbox.conf /tmp/anbox.conf || true
 RUN cp /lib/udev/rules.d/99-anbox.rules /tmp/99-anbox.rules || true
 
+
 # -------------------------------------------------------------
-# Stage 3: AKMODS Extractor (if modules are in akmods image)
-#          This is the complex part to get the .ko files if not directly found in Stage 2.
-#          We need the exact kernel version from Stage 2.
+# Stage 3: AKMODS Extractor (if modules are not found directly in Stage 2)
+#          This stage fetches the .ko files from Bazzite's AKMODS registry.
 # -------------------------------------------------------------
 FROM fedora:latest AS akmods_extractor # Use a minimal fedora image for skopeo/jq
 
@@ -35,8 +36,9 @@ ARG BAZZITE_KERNEL_VERSION=$(cat /tmp/bazzite_kernel_version.txt)
 
 # Define the AKMODS image and tag structure for Bazzite
 ARG UBLUE_AKMODS_IMAGE="ghcr.io/ublue-os/akmods"
-# The Bazzite akmods tags typically look like bazzite-42-6.15.6-103.bazzite.fc42.x86_64
-ARG BAZZITE_FEDORA_VERSION=$(echo "${BAZZITE_KERNEL_VERSION}" | cut -d'.' -f3 | cut -d'f' -f2 | cut -d'.' -f1) # Extracts 42 from fc42
+# Extracts 42 from fc42, e.g., 6.15.6-103.bazzite.fc42.x86_64 -> 42
+ARG BAZZITE_FEDORA_VERSION=$(echo "${BAZZITE_KERNEL_VERSION}" | sed -E 's/.*fc([0-9]+)\.x86_64/\1/')
+# Example Bazzite akmods tag: bazzite-42-6.15.6-103.bazzite.fc42.x86_64
 ARG AKMODS_TAG_FOR_BAZZITE="bazzite-${BAZZITE_FEDORA_VERSION}-${BAZZITE_KERNEL_VERSION}"
 
 # Pull the Bazzite AKMODS image
@@ -50,47 +52,48 @@ RUN AKMODS_TARGZ_DIGEST=$(jq -r '.layers[].digest' </tmp/bazzite_akmods/manifest
 
 # Move the rpms/kmods/* content to a central location for easy copying
 # These are the kmod RPMs themselves, e.g., kmod-anbox-binder-XYZ.rpm
-RUN mkdir -p /extracted_modules/kmod_rpms/ \
-    && find /tmp/bazzite_akmods/rpms/kmods/ -name "*.rpm" -exec mv {} /extracted_modules/kmod_rpms/ \; \
-    || true # Allow if no kmods are found (e.g., if modules are built-in)
+RUN mkdir -p /extracted_modules_from_akmods/ \
+    && find /tmp/bazzite_akmods/rpms/kmods/ -name "*.rpm" -exec mv {} /extracted_modules_from_akmods/ \; \
+    || true # Allow if no kmods are found
 
-# Now, extract the .ko files from these kmod RPMs
-# This will unpack the .ko files from the RPMs into standard /usr/lib/modules structure relative to current working dir
-RUN for rpm in /extracted_modules/kmod_rpms/*.rpm; do rpm2cpio "$rpm" | cpio -idmv; done \
-    || true # Allow if no kmod rpms were moved
-
-# Copy the specific .ko files and config files to /final_extracted_modules/ for main stage to pick up
+# Now, extract the .ko files from these kmod RPMs using rpm2cpio
+# This unpacks the .ko files into standard /usr/lib/modules structure relative to current working dir.
+# We then copy them to /final_extracted_modules for the main stage.
 RUN mkdir -p /final_extracted_modules/ \
-    && find /usr/lib/modules/ -name "ashmem_linux.ko" -exec cp {} /final_extracted_modules/ashmem_linux.ko \; \
-    && find /usr/lib/modules/ -name "binder_linux.ko" -exec cp {} /final_extracted_modules/binder_linux.ko \; \
-    || true # Allow if files not found
+    && for rpm in /extracted_modules_from_akmods/*.rpm; do rpm2cpio "$rpm" | cpio -idmv; done \
+    && cp /usr/lib/modules/${BAZZITE_KERNEL_VERSION}/extra/ashmem_linux.ko /final_extracted_modules/ashmem_linux.ko \
+    && cp /usr/lib/modules/${BAZZITE_KERNEL_VERSION}/extra/binder_linux.ko /final_extracted_modules/binder_linux.ko \
+    || true # Allow if files not found or cpio/cp fails
+
 # Also copy config files if they exist directly from akmods (less likely)
 RUN cp /tmp/bazzite_akmods/anbox.conf /final_extracted_modules/anbox.conf || true
 RUN cp /tmp/bazzite_akmods/99-anbox.rules /final_extracted_modules/99-anbox.rules || true
 
+
 # -------------------------------------------------------------
 # Stage 4: Your Main Custom Bluefin-DX Image Build
-#          This now only copies the *already located/extracted* files.
 # -------------------------------------------------------------
 FROM ghcr.io/ublue-os/bluefin-dx:latest
 
 # Copy your build scripts from the ctx stage
-COPY --from=ctx / build_files/ /ctx/
+COPY --from=ctx /ctx /ctx # Correct syntax: copy /ctx from ctx stage to /ctx in this stage
 
-# Copy kernel modules and config files from either bazzite_kernel_info or akmods_extractor
-# Preference for the directly found .ko from bazzite_kernel_info if they exist
-COPY --from=bazzite_kernel_info /usr/lib/modules/ /usr/lib/modules/ || true # Copy existing modules if present
-COPY --from=bazzite_kernel_info /tmp/anbox.conf /etc/modules-load.d/anbox.conf || true
-COPY --from=bazzite_kernel_info /tmp/99-anbox.rules /lib/udev/rules.d/99-anbox.rules || true
+# Copy the extracted .ko modules and config files from previous stages
+# These will be copied to the /tmp/ of the main image, to be processed by build.sh
+# Check preference: modules found directly in bazzite_kernel_info stage take precedence.
+COPY --from=bazzite_kernel_info /tmp/binder_linux.ko /tmp/binder_linux.ko || true
+COPY --from=bazzite_kernel_info /tmp/ashmem_linux.ko /tmp/ashmem_linux.ko || true
+COPY --from=bazzite_kernel_info /tmp/anbox.conf /tmp/anbox.conf || true
+COPY --from=bazzite_kernel_info /tmp/99-anbox.rules /tmp/99-anbox.rules || true
 
-# If not found directly, copy from akmods_extractor (this will overwrite if both exist, which is fine)
-COPY --from=akmods_extractor /final_extracted_modules/ashmem_linux.ko /usr/lib/modules/$(uname -r)/extra/ashmem_linux.ko || true
-COPY --from=akmods_extractor /final_extracted_modules/binder_linux.ko /usr/lib/modules/$(uname -r)/extra/binder_linux.ko || true
-COPY --from=akmods_extractor /final_extracted_modules/anbox.conf /etc/modules-load.d/anbox.conf || true
-COPY --from=akmods_extractor /final_extracted_modules/99-anbox.rules /lib/udev/rules.d/99-anbox.rules || true
+# If not found directly, try from akmods_extractor stage (this will only add if they didn't exist before)
+COPY --from=akmods_extractor /final_extracted_modules/ashmem_linux.ko /tmp/ashmem_linux.ko || true
+COPY --from=akmods_extractor /final_extracted_modules/binder_linux.ko /tmp/binder_linux.ko || true
+COPY --from=akmods_extractor /final_extracted_modules/anbox.conf /tmp/anbox.conf || true
+COPY --from=akmods_extractor /final_extracted_modules/99-anbox.rules /tmp/99-anbox.rules || true
 
-
-# Your original RUN directive, now calling a modified build.sh
+# Your original RUN directive, which calls build.sh
+# build.sh will find the copied .ko files in /tmp/
 RUN --mount=type=bind,from=ctx,source=/,target=/ctx \
     --mount=type=cache,dst=/var/cache \
     --mount=type=cache,dst=/var/log \
