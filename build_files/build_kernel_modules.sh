@@ -1,10 +1,12 @@
 #!/bin/bash
-set -euxo pipefail
+set -euxo pipefail # Strict error checking, unbound variables, echoing commands
 
 echo "Starting build_kernel_modules.sh - Checking and potentially building kernel modules."
 
 # -------------------------------------------------------------
 # 1. Determine the exact kernel version of the base image (MUST BE FIRST)
+#    This will report 6.11.0-1018-azure, even though we're FROM bluefin-dx.
+#    We will build modules for *this* kernel, but use headers from a different kernel-devel.
 # -------------------------------------------------------------
 TARGET_KERNEL_VERSION=$(uname -r)
 echo "Target Kernel Version detected: ${TARGET_KERNEL_VERSION}"
@@ -40,13 +42,19 @@ COMMON_BUILD_DEPS=(
 
 # Universal Blue's AKMODS image for fetching kernel-devel
 UBLUE_AKMODS_IMAGE="ghcr.io/ublue-os/akmods"
+
 # **CRITICAL:** Hardcode a known-good, *generic* Fedora 42 kernel tag from the akmods list.
 # This kernel-devel will be used for compilation, hoping it's ABI-compatible with TARGET_KERNEL_VERSION.
-# Pick the highest 'main-42' kernel from your 'skopeo list-tags' output.
-AKMODS_TAG_FOR_KERNEL_DEVEL="main-42-6.15.6-200.fc42.x86_64" # <-- Adjust this to the *absolute latest* 'main-42' kernel tag you see.
+# Based on your 'skopeo list-tags' output, pick the *latest* 'main-42-X.Y.Z-300.fc42.x86_64' tag.
+# As of your provided list, "main-42-6.15.6-200.fc42.x86_64" is one of the highest generic F42 kernels.
+AKMODS_TAG_FOR_KERNEL_DEVEL="main-42-6.15.6-200.fc42.x86_64" # <-- CONFIRM THIS IS THE LATEST GENERIC F42 KERNEL IN THE AKMODS LIST!
 
 ANBOX_MODULES_REPO_URL="https://github.com/choff/anbox-modules.git"
-ANBOX_MODULES_REPO_COMMIT="" # Or your specific compatible commit hash for this kernel
+# IMPORTANT: It's HIGHLY recommended to specify a commit hash here.
+# Find a commit of choff/anbox-modules that is known to work with a Linux kernel around 6.15.x.
+# Example (replace with actual working commit): ANBOX_MODULES_REPO_COMMIT="a1b2c3d4e5f6..."
+ANBOX_MODULES_REPO_COMMIT="" # Leaving empty means cloning 'main' which might be too new/old
+
 
 # --- Functions ---
 
@@ -93,13 +101,13 @@ fi
 
 echo "One or more kernel modules are missing. Proceeding with full module build."
 
-# KERNEL_SOURCE_DIR definition will be based on the kernel-devel we *pull and install*
-KERNEL_SOURCE_DIR_FOR_BUILD="" # This will be set after installing the devel RPM
+# KERNEL_SOURCE_DIR for DKMS compilation (will be set after installing the devel RPM)
+KERNEL_SOURCE_DIR_FOR_BUILD=""
 
 # 2. Temporarily install general build tools (NOW INCLUDING SKOPEO & JQ)
 install_temp_build_deps
 
-# 2a. Fetch and Install a specific kernel-devel RPM from UBlue's akmods
+# 2a. Fetch and Install the SPECIFIC kernel-devel RPM for the AKMODS_TAG_FOR_KERNEL_DEVEL
 echo "Fetching and installing specific kernel-devel RPM using skopeo for AKMODS_TAG: ${AKMODS_TAG_FOR_KERNEL_DEVEL}..."
 KERNEL_RPM_DIR="/tmp/akmods_kernel_rpms"
 mkdir -p "${KERNEL_RPM_DIR}"
@@ -116,8 +124,7 @@ fi
 
 # Determine the kernel version from the AKMODS tag to install the specific devel package
 # Example: "main-42-6.15.6-200.fc42.x86_64" -> "6.15.6-200.fc42.x86_64"
-# This might need adjustment depending on the exact AKMODS_TAG_FOR_KERNEL_DEVEL format
-KERNEL_VERSION_FROM_AKMODS_TAG=$(echo "${AKMODS_TAG_FOR_KERNEL_DEVEL}" | sed -E 's/^(main|coreos-stable|bazzite|surface)-[0-9]+-(.*)$/\2/')
+KERNEL_VERSION_FROM_AKMODS_TAG=$(echo "${AKMODS_TAG_FOR_KERNEL_DEVEL}" | sed -E 's/^(main|coreos-stable|bazzite|surface|longterm)-[0-9]+-(.*)$/\2/')
 
 # Install the specific kernel-devel RPM
 echo "Installing kernel-devel RPM: ${KERNEL_RPM_DIR}/kernel-devel-${KERNEL_VERSION_FROM_AKMODS_TAG}.rpm"
@@ -125,15 +132,15 @@ dnf5 install -y "${KERNEL_RPM_DIR}/kernel-devel-${KERNEL_VERSION_FROM_AKMODS_TAG
 echo "Specific kernel-devel RPM for AKMODS_TAG installed."
 
 # Set the KERNEL_SOURCE_DIR for DKMS build to match the installed devel package
-KERNEL_SOURCE_DIR="/usr/src/kernels/${KERNEL_VERSION_FROM_AKMODS_TAG}"
-echo "DKMS will use kernel source directory: ${KERNEL_SOURCE_DIR}"
+KERNEL_SOURCE_DIR_FOR_BUILD="/usr/src/kernels/${KERNEL_VERSION_FROM_AKMODS_TAG}"
+echo "DKMS will use kernel source directory: ${KERNEL_SOURCE_DIR_FOR_BUILD}"
 
 
 # >>> Verify kernel source directory *after* installation <<<
 echo "Verifying kernel source directory contents AFTER kernel-devel installation:"
-ls -l "${KERNEL_SOURCE_DIR}" || true
-if [ ! -d "${KERNEL_SOURCE_DIR}" ] || [ -z "$(ls -A "${KERNEL_SOURCE_DIR}")" ]; then
-    echo "CRITICAL ERROR: Kernel source directory ${KERNEL_SOURCE_DIR} is still empty or does NOT exist after attempting installation!"
+ls -l "${KERNEL_SOURCE_DIR_FOR_BUILD}" || true
+if [ ! -d "${KERNEL_SOURCE_DIR_FOR_BUILD}" ] || [ -z "$(ls -A "${KERNEL_SOURCE_DIR_FOR_BUILD}")" ]; then
+    echo "CRITICAL ERROR: Kernel source directory ${KERNEL_SOURCE_DIR_FOR_BUILD} is still empty or does NOT exist after attempting installation!"
     echo "This indicates a fundamental issue with kernel-devel package extraction. Cannot proceed."
     exit 1 # Exit with error, as this is unrecoverable without headers
 fi
@@ -141,7 +148,8 @@ fi
 # >>> Create the expected DKMS symlink <<<
 echo "Creating /lib/modules/${TARGET_KERNEL_VERSION}/build symlink for DKMS..."
 mkdir -p /lib/modules/"${TARGET_KERNEL_VERSION}"/
-ln -sfn "${KERNEL_SOURCE_DIR}" /lib/modules/"${TARGET_KERNEL_VERSION}"/build
+# Link to the source directory we *just* ensured is populated
+ln -sfn "${KERNEL_SOURCE_DIR_FOR_BUILD}" /lib/modules/"${TARGET_KERNEL_VERSION}"/build
 echo "Symlink created. Verifying symlink target:"
 ls -l /lib/modules/"${TARGET_KERNEL_VERSION}"/build
 
@@ -174,7 +182,7 @@ for i in "${!ANBOX_SOURCE_DIRS[@]}"; do
     echo "Attempting DKMS build for ${DKMS_NAME}/${DKMS_VERSION} (verbose output follows)..."
     # Build with --kernelsourcedir pointing to the *pulled* kernel-devel headers
     # and --arch x86_64 for clarity.
-    dkms build "${DKMS_NAME}/${DKMS_VERSION}" --kernelsourcedir "${KERNEL_SOURCE_DIR}" --arch x86_64 --verbose
+    dkms build "${DKMS_NAME}/${DKMS_VERSION}" --kernelsourcedir "${KERNEL_SOURCE_DIR_FOR_BUILD}" --arch x86_64 --verbose
     
     BUILD_LOG_PATH="/var/lib/dkms/${DKMS_NAME}/${DKMS_VERSION}/build/make.log"
     if [ -f "${BUILD_LOG_PATH}" ]; then
