@@ -3,6 +3,13 @@ set -euxo pipefail
 
 echo "Starting build_kernel_modules.sh - Checking and potentially building kernel modules."
 
+# -------------------------------------------------------------
+# 1. Determine the exact kernel version of the base image
+#    Moved this up so TARGET_KERNEL_VERSION is defined before COMMON_BUILD_DEPS.
+# -------------------------------------------------------------
+TARGET_KERNEL_VERSION=$(uname -r)
+echo "Target Kernel Version detected: ${TARGET_KERNEL_VERSION}"
+
 # --- Configuration ---
 REQUIRED_MODULES=(
     "binder_linux"
@@ -21,21 +28,20 @@ DKMS_MODULE_VERSIONS=(
     "1"
 )
 
-# Common build dependencies for kernel modules (re-including kernel-devel)
+# Common build dependencies for kernel modules (kernel-devel now correctly references TARGET_KERNEL_VERSION)
 COMMON_BUILD_DEPS=(
     git
     make
     gcc
     dkms
-    # Add any other universally required build dependencies here (e.g., flex, bison, libelf-devel)
-    "kernel-devel-${TARGET_KERNEL_VERSION}" # <-- RE-ADDING THIS HERE
+    "kernel-devel-${TARGET_KERNEL_VERSION}" # This will now be correctly evaluated
 )
 
 ANBOX_MODULES_REPO_URL="https://github.com/choff/anbox-modules.git"
 ANBOX_MODULES_REPO_COMMIT="" # Or your specific commit hash
 
 # --- Functions ---
-
+# ... (all functions remain the same) ...
 check_modules_present() {
     local modules_missing=false
     for module in "${REQUIRED_MODULES[@]}"; do
@@ -51,18 +57,17 @@ check_modules_present() {
 
 install_temp_build_deps() {
     echo "Installing temporary build dependencies for kernel modules..."
-    # Use rpm-ostree install - it's designed for layering and can fix state
-    # Added --force to ensure it truly re-installs if needed.
     rpm-ostree install --apply-live --allow-inactive --force "${COMMON_BUILD_DEPS[@]}"
     echo "Temporary build dependencies installed."
 }
 
 remove_temp_build_deps() {
     echo "Cleaning up temporary build dependencies..."
-    # Use rpm-ostree override remove for clean removal of layered packages
     rpm-ostree override remove "${COMMON_BUILD_DEPS[@]}" || true
     echo "Temporary build dependencies cleaned up."
 }
+# --- End Functions ---
+
 
 # --- Main Logic ---
 
@@ -78,16 +83,12 @@ fi
 
 echo "One or more kernel modules are missing. Proceeding with full module build."
 
-# 1. Determine the exact kernel version of the base image
-TARGET_KERNEL_VERSION=$(uname -r)
-echo "Target Kernel Version detected: ${TARGET_KERNEL_VERSION}"
+# The TARGET_KERNEL_VERSION is now defined.
+echo "DKMS will use kernel source directory: /usr/src/kernels/${TARGET_KERNEL_VERSION}"
+KERNEL_SOURCE_DIR="/usr/src/kernels/${TARGET_KERNEL_VERSION}" # Define it here too for clarity
 
-# Define the kernel source directory where kernel-devel installs headers
-KERNEL_SOURCE_DIR="/usr/src/kernels/${TARGET_KERNEL_VERSION}"
-echo "DKMS will use kernel source directory: ${KERNEL_SOURCE_DIR}"
 
 # 2. Temporarily install general build tools AND kernel-devel
-# This time using rpm-ostree install with force.
 install_temp_build_deps
 
 # >>> Verify kernel source directory *again* after installation <<<
@@ -99,7 +100,7 @@ if [ ! -d "${KERNEL_SOURCE_DIR}" ] || [ -z "$(ls -A "${KERNEL_SOURCE_DIR}")" ]; 
     exit 1 # Exit with error, as this is unrecoverable without headers
 fi
 
-# >>> Create the expected DKMS symlink (still needed if kernel-devel doesn't do it) <<<
+# >>> Create the expected DKMS symlink <<<
 echo "Creating /lib/modules/${TARGET_KERNEL_VERSION}/build symlink for DKMS..."
 mkdir -p /lib/modules/"${TARGET_KERNEL_VERSION}"/
 ln -sfn "${KERNEL_SOURCE_DIR}" /lib/modules/"${TARGET_KERNEL_VERSION}"/build
