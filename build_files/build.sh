@@ -16,20 +16,27 @@ echo "Path to rpm-ostree: $(which rpm-ostree || true)"
 echo "--- DEBUG INFO END (from main build.sh) ---"
 # --- DEBUG END ---
 
-### Install mofules
-/ctx/build_kernel_modules.sh
+# -------------------------------------------------------------
+# Call the kernel module modification script first
+# It will internally decide if a build is needed.
+# -------------------------------------------------------------
+echo "Calling build_kernel_modules.sh..."
+# Note: Path is now /ctx/build_files/build_kernel_modules.sh due to new COPY setup
+/ctx/build_files/build_kernel_modules.sh
+echo "build_kernel_modules.sh finished."
 
-### Install packages
+# -------------------------------------------------------------
+# Install other packages (including Waydroid application)
+# -------------------------------------------------------------
+echo "Installing main packages..."
 
-# Packages can be installed from any enabled yum repo on the image.
-# RPMfusion repos are available by default in ublue main images
-# List of rpmfusion packages can be found here:
-# https://mirrors.rpmfusion.org/mirrorlist?path=free/fedora/updates/39/x86_64/repoview/index.html&protocol=https&redirect=1
+# Your existing packages
+dnf5 install -y tmux
 
-# this installs a package from fedora repos
-dnf5 install -y tmux 
-
-dnf5 install -y waydroid lxc
+# Install Waydroid application and its user-space dependencies
+echo "Installing waydroid application and its user-space dependencies..."
+dnf5 install -y waydroid lxc # `lxc` is a common Waydroid dependency
+echo "Waydroid application and its user-space dependencies installed."
 
 # Use a COPR Example:
 #
@@ -39,7 +46,13 @@ dnf5 install -y waydroid lxc
 # dnf5 -y copr disable ublue-os/staging
 
 #### Example for enabling a System Unit File
-
 systemctl enable podman.socket
 
+# -------------------------------------------------------------
+# Final cleanup for rpm-ostree cache
+# This should be done at the very end of the main build.sh
+# -------------------------------------------------------------
+echo "Running rpm-ostree cleanup..."
 rpm-ostree cleanup -m
+
+echo "Main build.sh finished."
