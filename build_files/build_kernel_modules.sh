@@ -4,12 +4,12 @@ set -euxo pipefail # Strict error checking, unbound variables, echoing commands
 echo "Starting build_kernel_modules.sh - Checking and potentially building kernel modules."
 
 # -------------------------------------------------------------
-# 1. Determine the exact kernel version of the base image (for actual module loading)
-#    This is still the kernel of the currently running build environment.
-#    It seems to be 6.11.0-1018-azure from previous logs.
+# 1. Determine the exact kernel version of the base image
+#    This should consistently report a standard Fedora kernel (e.g., 6.15.6-200.fc42.x86_64)
 # -------------------------------------------------------------
-TARGET_KERNEL_VERSION_FOR_RUNNING_KERNEL=$(uname -r)
-echo "Target Running Kernel Version detected: ${TARGET_KERNEL_VERSION_FOR_RUNNING_KERNEL}"
+TARGET_KERNEL_VERSION=$(uname -r)
+echo "Target Kernel Version detected: ${TARGET_KERNEL_VERSION}"
+
 
 # --- Configuration ---
 REQUIRED_MODULES=(
@@ -29,29 +29,20 @@ DKMS_MODULE_VERSIONS=(
     "1"
 )
 
-# Common build dependencies for kernel modules (including skopeo and jq)
+# Common build dependencies for kernel modules.
+# kernel-devel will be installed via rpm-ostree from standard repos.
 COMMON_BUILD_DEPS=(
     git
     make
     gcc
     dkms
-    skopeo # <-- Need skopeo to pull the akmods image
-    jq     # <-- Need jq to parse manifest.json
+    "kernel-devel-${TARGET_KERNEL_VERSION}" # This package *should* now be found in standard repos
 )
 
-# Universal Blue's AKMODS image for fetching kernel-devel
-UBLUE_AKMODS_IMAGE="ghcr.io/ublue-os/akmods"
-
-# **CRITICAL HARDCODED KERNEL-DEVEL FOR COMPILATION**
-# This is the kernel-devel version we will *use for compilation*.
-# It's a generic Fedora 42 kernel from the UBlue akmods registry that we know exists.
-# We are assuming ABI compatibility with the 6.11.0-1018-azure kernel.
-KERNEL_VERSION_FOR_COMPILATION="6.15.6-200.fc42.x86_64" # <-- CONFIRMED FROM YOUR SKOPEO LIST-TAGS
-AKMODS_TAG_FOR_KERNEL_DEVEL="main-42-${KERNEL_VERSION_FOR_COMPILATION}"
-
 ANBOX_MODULES_REPO_URL="https://github.com/choff/anbox-modules.git"
-# IMPORTANT: It's HIGHLY recommended to specify a compatible commit hash for Linux 6.15.x.
-# Example (replace with actual working commit): ANBOX_MODULES_REPO_COMMIT="a1b2c3d4e5f6..."
+# IMPORTANT: Highly recommended to specify a compatible commit hash for Linux 6.15.x or newer.
+# Check choff/anbox-modules GitHub for a commit known to work with your specific kernel version.
+# Example: ANBOX_MODULES_REPO_COMMIT="a1b2c3d4e5f6..." # REPLACE with actual commit
 ANBOX_MODULES_REPO_COMMIT=""
 
 
@@ -71,18 +62,15 @@ check_modules_present() {
 }
 
 install_temp_build_deps() {
-    echo "Installing temporary build dependencies for kernel modules (including skopeo and jq)..."
+    echo "Installing temporary build dependencies for kernel modules..."
+    # Using rpm-ostree install for all build deps. This should now succeed for kernel-devel.
     rpm-ostree install --apply-live --allow-inactive "${COMMON_BUILD_DEPS[@]}"
     echo "Temporary build dependencies installed."
 }
 
 remove_temp_build_deps() {
     echo "Cleaning up temporary build dependencies..."
-    # We will remove COMMON_BUILD_DEPS and also the specific kernel-devel package
-    # for the kernel we pulled for compilation.
-    rpm-ostree override remove "${COMMON_BUILD_DEPS[@]}" \
-        "kernel-devel-${KERNEL_VERSION_FOR_COMPILATION}" \
-        || true
+    rpm-ostree override remove "${COMMON_BUILD_DEPS[@]}" || true
     echo "Temporary build dependencies cleaned up."
 }
 
@@ -100,73 +88,29 @@ fi
 
 echo "One or more kernel modules are missing. Proceeding with full module build."
 
-# KERNEL_SOURCE_DIR for DKMS compilation (will be set after installing the devel RPM)
-KERNEL_SOURCE_DIR_FOR_BUILD=""
+# Define the kernel source directory where kernel-devel installs headers
+KERNEL_SOURCE_DIR="/usr/src/kernels/${TARGET_KERNEL_VERSION}"
+echo "DKMS will use kernel source directory: ${KERNEL_SOURCE_DIR}"
 
-# 2. Temporarily install general build tools (INCLUDING SKOPEO & JQ)
+# 2. Temporarily install general build tools AND kernel-devel from standard repos
 install_temp_build_deps
-
-# 2a. Fetch and Install the SPECIFIC kernel-devel RPM for the chosen compilation kernel
-echo "Fetching and installing specific kernel-devel RPM using skopeo for AKMODS_TAG: ${AKMODS_TAG_FOR_KERNEL_DEVEL}..."
-KERNEL_RPM_DIR="/tmp/akmods_kernel_rpms"
-mkdir -p "${KERNEL_RPM_DIR}"
-
-echo "Pulling UBlue AKMODS image: ${UBLUE_AKMODS_IMAGE}:${AKMODS_TAG_FOR_KERNEL_DEVEL}"
-skopeo copy --retry-times 3 "docker://${UBLUE_AKMODS_IMAGE}:${AKMODS_TAG_FOR_KERNEL_DEVEL}" "dir:${KERNEL_RPM_DIR}"
-
-echo "Extracting RPMs from pulled AKMODS content..."
-AKMODS_TARGZ_DIGEST=$(jq -r '.layers[].digest' <"${KERNEL_RPM_DIR}/manifest.json" | cut -d : -f 2)
-tar -xvzf "${KERNEL_RPM_DIR}/${AKMODS_TARGZ_DIGEST}" -C "${KERNEL_RPM_DIR}"/
-
-# >>> CRITICAL FIX: Move contents of kernel-rpms/ and rpms/ to the root of KERNEL_RPM_DIR <<<
-echo "Moving extracted RPMs to top level of ${KERNEL_RPM_DIR}..."
-if [ -d "${KERNEL_RPM_DIR}/kernel-rpms" ]; then
-    mv "${KERNEL_RPM_DIR}/kernel-rpms"/* "${KERNEL_RPM_DIR}/"
-fi
-if [ -d "${KERNEL_RPM_DIR}/rpms" ]; then
-    mv "${KERNEL_RPM_DIR}/rpms"/* "${KERNEL_RPM_DIR}/"
-fi
-rmdir "${KERNEL_RPM_DIR}/kernel-rpms" || true # Clean up empty dir
-rmdir "${KERNEL_RPM_DIR}/rpms" || true       # Clean up empty dir
-echo "RPMs moved."
-
-
-# Install the specific kernel-devel RPM
-echo "Installing kernel-devel RPM: ${KERNEL_RPM_DIR}/kernel-devel-${KERNEL_VERSION_FOR_COMPILATION}.rpm"
-# Check if the file actually exists before attempting to install
-if [ ! -f "${KERNEL_RPM_DIR}/kernel-devel-${KERNEL_VERSION_FOR_COMPILATION}.rpm" ]; then
-    echo "CRITICAL ERROR: kernel-devel RPM not found at expected path after extraction: ${KERNEL_RPM_DIR}/kernel-devel-${KERNEL_VERSION_FOR_COMPILATION}.rpm"
-    echo "This indicates an issue with skopeo pull or tar extraction, or the hardcoded AKMODS_TAG_FOR_KERNEL_DEVEL is incorrect."
-    echo "Contents of ${KERNEL_RPM_DIR}:"
-    ls -l "${KERNEL_RPM_DIR}" || true
-    exit 1
-fi
-
-dnf5 install -y "${KERNEL_RPM_DIR}/kernel-devel-${KERNEL_VERSION_FOR_COMPILATION}.rpm"
-echo "Specific kernel-devel RPM for compilation installed."
-
-# Set the KERNEL_SOURCE_DIR for DKMS build to match the installed devel package
-KERNEL_SOURCE_DIR_FOR_BUILD="/usr/src/kernels/${KERNEL_VERSION_FOR_COMPILATION}"
-echo "DKMS will use kernel source directory: ${KERNEL_SOURCE_DIR_FOR_BUILD}"
-
 
 # >>> Verify kernel source directory *after* installation <<<
 echo "Verifying kernel source directory contents AFTER kernel-devel installation:"
-ls -l "${KERNEL_SOURCE_DIR_FOR_BUILD}" || true
-if [ ! -d "${KERNEL_SOURCE_DIR_FOR_BUILD}" ] || [ -z "$(ls -A "${KERNEL_SOURCE_DIR_FOR_BUILD}")" ]; then
-    echo "CRITICAL ERROR: Kernel source directory ${KERNEL_SOURCE_DIR_FOR_BUILD} is still empty or does NOT exist after attempting installation!"
-    echo "This indicates a fundamental issue with kernel-devel package extraction. Cannot proceed."
+ls -l "${KERNEL_SOURCE_DIR}" || true
+if [ ! -d "${KERNEL_SOURCE_DIR}" ] || [ -z "$(ls -A "${KERNEL_SOURCE_DIR}")" ]; then
+    echo "CRITICAL ERROR: Kernel source directory ${KERNEL_SOURCE_DIR} is still empty or does NOT exist after attempting installation!"
+    echo "This indicates that 'kernel-devel-${TARGET_KERNEL_VERSION}' package was not successfully installed or did not populate headers."
+    echo "Cannot proceed with module compilation."
     exit 1 # Exit with error, as this is unrecoverable without headers
 fi
 
 # >>> Create the expected DKMS symlink <<<
-# This symlink is for the *running kernel* (TARGET_KERNEL_VERSION_FOR_RUNNING_KERNEL),
-# but it points to the headers of the *compilation kernel* (KERNEL_VERSION_FOR_COMPILATION).
-echo "Creating /lib/modules/${TARGET_KERNEL_VERSION_FOR_RUNNING_KERNEL}/build symlink for DKMS..."
-mkdir -p /lib/modules/"${TARGET_KERNEL_VERSION_FOR_RUNNING_KERNEL}"/
-ln -sfn "${KERNEL_SOURCE_DIR_FOR_BUILD}" /lib/modules/"${TARGET_KERNEL_VERSION_FOR_RUNNING_KERNEL}"/build
+echo "Creating /lib/modules/${TARGET_KERNEL_VERSION}/build symlink for DKMS..."
+mkdir -p /lib/modules/"${TARGET_KERNEL_VERSION}"/
+ln -sfn "${KERNEL_SOURCE_DIR}" /lib/modules/"${TARGET_KERNEL_VERSION}"/build
 echo "Symlink created. Verifying symlink target:"
-ls -l /lib/modules/"${TARGET_KERNEL_VERSION_FOR_RUNNING_KERNEL}"/build
+ls -l /lib/modules/"${TARGET_KERNEL_VERSION}"/build
 
 
 # 3. Clone Anbox Kernel Modules source
@@ -195,9 +139,8 @@ for i in "${!ANBOX_SOURCE_DIRS[@]}"; do
     TEMP_SRC_DIRS+=("${MODULE_PATH}")
 
     echo "Attempting DKMS build for ${DKMS_NAME}/${DKMS_VERSION} (verbose output follows)..."
-    # Build with --kernelsourcedir pointing to the *pulled* kernel-devel headers
-    # and --arch x86_64 for clarity.
-    dkms build "${DKMS_NAME}/${DKMS_VERSION}" --kernelsourcedir "${KERNEL_SOURCE_DIR_FOR_BUILD}" --arch x86_64 --verbose
+    # Build with --kernelsourcedir pointing to the *installed* kernel-devel headers
+    dkms build "${DKMS_NAME}/${DKMS_VERSION}" --kernelsourcedir "${KERNEL_SOURCE_DIR}" --arch x86_64 --verbose
     
     BUILD_LOG_PATH="/var/lib/dkms/${DKMS_NAME}/${DKMS_VERSION}/build/make.log"
     if [ -f "${BUILD_LOG_PATH}" ]; then
@@ -208,7 +151,6 @@ for i in "${!ANBOX_SOURCE_DIRS[@]}"; do
     fi
     
     echo "Attempting DKMS install for ${DKMS_NAME}/${DKMS_VERSION}..."
-    # Install for the TARGET_KERNEL_VERSION_FOR_RUNNING_KERNEL (the running kernel)
     dkms install "${DKMS_NAME}/${DKMS_VERSION}"
 
 done
@@ -216,7 +158,7 @@ echo "All specified kernel modules built and installed via DKMS."
 
 # 5. Update kernel module dependencies
 echo "Running depmod -a..."
-depmod -a "${TARGET_KERNEL_VERSION_FOR_RUNNING_KERNEL}"
+depmod -a "${TARGET_KERNEL_VERSION}"
 echo "depmod complete."
 
 # 6. Install configuration files (specific to Anbox)
@@ -234,7 +176,6 @@ rm -rf "${ANBOX_MODULES_REPO_DIR}"
 for dir in "${TEMP_SRC_DIRS[@]}"; do
     rm -rf "${dir}"
 done
-rm -rf "${KERNEL_RPM_DIR}" # Clean up the pulled akmods content
 echo "Source directories cleaned up."
 
 echo "build_kernel_modules.sh finished (completed build)."
