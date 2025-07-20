@@ -18,40 +18,44 @@ echo "--- DEBUG INFO END (from main build.sh) ---"
 
 # -------------------------------------------------------------
 # Call the kernel module modification script first
-# It will internally decide if a build is needed.
 # -------------------------------------------------------------
 echo "Calling build_kernel_modules.sh..."
-# >>> FIX: Updated path to build_kernel_modules.sh <<<
-# It's now at /ctx/build_files/build_kernel_modules.sh due to the Containerfile's COPY --from=ctx /ctx_data /ctx/build_files
 /ctx/build_files/build_kernel_modules.sh
 echo "build_kernel_modules.sh finished."
+
+# -------------------------------------------------------------
+# Install Anbox Configuration Files (EMBEDDED HERE)
+# This directly creates the files needed by Waydroid.
+# -------------------------------------------------------------
+echo "Creating /etc/modules-load.d/anbox.conf..."
+tee /etc/modules-load.d/anbox.conf <<EOF
+ashmem_linux
+binder_linux
+EOF
+echo "anbox.conf created."
+
+echo "Creating /lib/udev/rules.d/99-anbox.rules..."
+tee /lib/udev/rules.d/99-anbox.rules <<EOF
+# Anbox
+# Creates the binder and ashmem devices
+KERNEL=="binder", MODE="0666"
+KERNEL=="ashmem", MODE="0666"
+EOF
+echo "99-anbox.rules created."
 
 # -------------------------------------------------------------
 # Install other packages (including Waydroid application)
 # -------------------------------------------------------------
 echo "Installing main packages..."
 
-# Your existing packages
 dnf5 install -y tmux
-
-# Install Waydroid application and its user-space dependencies
-echo "Installing waydroid application and its user-space dependencies..."
-dnf5 install -y waydroid lxc # `lxc` is a common Waydroid dependency
+dnf5 install -y waydroid lxc
 echo "Waydroid application and its user-space dependencies installed."
 
-# Use a COPR Example:
-#
-# dnf5 -y copr enable ublue-os/staging
-# dnf5 -y install package
-# Disable COPRs so they don't end up enabled on the final image:
-# dnf5 -y copr disable ublue-os/staging
-
-#### Example for enabling a System Unit File
-systemctl enable podman.socket
+# ... (other package installations) ...
 
 # -------------------------------------------------------------
 # Final cleanup for rpm-ostree cache
-# This should be done at the very end of the main build.sh
 # -------------------------------------------------------------
 echo "Running rpm-ostree cleanup..."
 rpm-ostree cleanup -m

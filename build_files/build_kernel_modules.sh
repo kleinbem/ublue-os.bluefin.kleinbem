@@ -1,5 +1,5 @@
 #!/bin/bash
-set -euxo pipefail # Strict error checking, unbound variables, echoing commands
+set -euxo pipefail
 
 echo "Starting build_kernel_modules.sh - Performing all kernel module extraction and setup."
 
@@ -8,17 +8,18 @@ REQUIRED_MODULES=(
     "binder_linux"
     "ashmem_linux"
 )
-ANBOX_MODULES_REPO_URL="https://github.com/choff/anbox-modules.git" # For config files
-ANBOX_MODULES_REPO_COMMIT="" # Or your specific compatible commit hash for Linux 6.15.x
+# We need to correctly obtain the kernel version for the running build environment
+# even if it's the 6.11.0-1018-azure kernel.
+TARGET_KERNEL_VERSION=$(uname -r)
+echo "Target Kernel Version detected: ${TARGET_KERNEL_VERSION}"
 
-UBLUE_AKMODS_IMAGE="ghcr.io/ublue-os/akmods"
-
-# Hardcode a known-good Bazzite kernel version for extraction.
-# This will be used to pull the correct akmods image.
-# Example from your previous skopeo list-tags output.
+# This is the Bazzite kernel version for which we will pull AKMODs.
+# We hardcode it, as dynamic ARG evaluation in Containerfile's previous stages was problematic.
 BAZZITE_KERNEL_VERSION_FOR_EXTRACTION="6.15.6-103.bazzite.fc42.x86_64"
 BAZZITE_FEDORA_VERSION_FOR_EXTRACTION="42" # From fc42 in the kernel version
 AKMODS_TAG_FOR_BAZZITE="bazzite-${BAZZITE_FEDORA_VERSION_FOR_EXTRACTION}-${BAZZITE_KERNEL_VERSION_FOR_EXTRACTION}"
+
+UBLUE_AKMODS_IMAGE="ghcr.io/ublue-os/akmods"
 
 
 # --- Functions ---
@@ -88,9 +89,7 @@ find "${KERNEL_RPM_DIR}/rpms/kmods/" -name "*.rpm" -exec mv {} "${EXTRACTED_RPMS
 echo "kmod RPMs moved."
 
 # Now, extract the .ko files from these kmod RPMs using rpm2cpio
-# Modules should be extracted to /usr/lib/modules/<kernel_version>/extra/
-# We need to manually set the target path for cpio or copy after extraction.
-# We will extract to a temporary location and then copy specific .ko files.
+# We extract to a temporary location and then copy specific .ko files.
 TEMP_KO_EXTRACT_DIR="/tmp/temp_ko_extract"
 mkdir -p "${TEMP_KO_EXTRACT_DIR}"
 
@@ -103,7 +102,7 @@ done
 echo ".ko files extracted to temporary directory."
 
 # -------------------------------------------------------------
-# 3. Copy the extracted .ko files and config files to final /usr/lib/modules/ location
+# 3. Copy the extracted .ko files to final /usr/lib/modules/ location
 # -------------------------------------------------------------
 TARGET_RUNNING_KERNEL_VERSION=$(uname -r) # Get the actual running kernel of the Bluefin image
 MODULE_FINAL_DEST_DIR="/usr/lib/modules/${TARGET_RUNNING_KERNEL_VERSION}/extra"
@@ -116,14 +115,6 @@ cp "${TEMP_KO_EXTRACT_DIR}/usr/lib/modules/${BAZZITE_KERNEL_VERSION_FOR_EXTRACTI
     || (echo "ERROR: Failed to copy binder_linux.ko to final location!" && exit 1)
 echo ".ko files copied."
 
-# Copy Anbox configuration files (from /ctx/build_files/ where Containerfile copied them)
-echo "Copying Anbox configuration files..."
-cp /ctx/build_files/anbox.conf /etc/modules-load.d/anbox.conf \
-    || (echo "ERROR: Failed to copy anbox.conf!" && exit 1)
-cp /ctx/build_files/99-anbox.rules /lib/udev/rules.d/99-anbox.rules \
-    || (echo "ERROR: Failed to copy 99-anbox.rules!" && exit 1)
-echo "Config files copied."
-
 # -------------------------------------------------------------
 # 4. Update kernel module dependencies
 # -------------------------------------------------------------
@@ -134,7 +125,7 @@ echo "depmod complete."
 # -------------------------------------------------------------
 # 5. Cleanup temporary tools and extracted content
 # -------------------------------------------------------------
-echo "Cleaning up temporary files and tools..."
+echo "Cleaning up temporary tools and extracted content..."
 dnf5 remove -y skopeo jq tar gzip rpm-build || true
 rm -rf "${KERNEL_RPM_DIR}" "${TEMP_KO_EXTRACT_DIR}"
 echo "Cleanup complete."
