@@ -41,15 +41,16 @@ else
     echo "WARNING: One or more kernel modules are still missing after copy steps. Waydroid might not work."
     # We allow the build to continue to see if it installs waydroid,
     # but the user will know there's a module issue.
-    # We should add more robust logging to see what was actually copied.
-    echo "Contents of /tmp/ after copying from stages:"
-    ls -l /tmp/extracted_*.ko /tmp/anbox.conf /tmp/99-anbox.rules || true
+    # Add more robust logging to see what was actually copied for debugging.
+    echo "Contents of /tmp/ after copying from stages (to debug missing files):"
+    ls -l /tmp/extracted_binder_linux.ko /tmp/extracted_ashmem_linux.ko /tmp/anbox.conf /tmp/99-anbox.rules || true
+    
     echo "Attempting to copy modules into /usr/lib/modules/..."
     mkdir -p /usr/lib/modules/"${TARGET_KERNEL_VERSION}"/extra/
-    cp /tmp/extracted_binder_linux.ko /usr/lib/modules/"${TARGET_KERNEL_VERSION}"/extra/ || echo "Failed to copy binder_linux.ko!"
-    cp /tmp/extracted_ashmem_linux.ko /usr/lib/modules/"${TARGET_KERNEL_VERSION}"/extra/ || echo "Failed to copy ashmem_linux.ko!"
-    cp /tmp/anbox.conf /etc/modules-load.d/anbox.conf || echo "Failed to copy anbox.conf!"
-    cp /tmp/99-anbox.rules /lib/udev/rules.d/99-anbox.rules || echo "Failed to copy 99-anbox.rules!"
+    cp /tmp/extracted_binder_linux.ko /usr/lib/modules/"${TARGET_KERNEL_VERSION}"/extra/ || echo "Failed to copy binder_linux.ko to final location!"
+    cp /tmp/extracted_ashmem_linux.ko /usr/lib/modules/"${TARGET_KERNEL_VERSION}"/extra/ || echo "Failed to copy ashmem_linux.ko to final location!"
+    cp /tmp/anbox.conf /etc/modules-load.d/anbox.conf || echo "Failed to copy anbox.conf to final location!"
+    cp /tmp/99-anbox.rules /lib/udev/rules.d/99-anbox.rules || echo "Failed to copy 99-anbox.rules to final location!"
 
 fi
 

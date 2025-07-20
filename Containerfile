@@ -1,6 +1,6 @@
 # Stage 1: Context for build scripts (always at the top)
 FROM scratch AS ctx
-COPY build_files /
+COPY build_files /build_files # Copy build_files content to /build_files in ctx stage. This makes path /ctx/build_files/my_script
 
 # -------------------------------------------------------------
 # Stage 2: Bazzite Base for Kernel Version & Initial Module Path Check
@@ -19,7 +19,6 @@ RUN find /usr/lib/modules/ -name "binder_linux.ko" -exec cp {} /tmp/binder_linux
 RUN find /usr/lib/modules/ -name "ashmem_linux.ko" -exec cp {} /tmp/ashmem_linux.ko \; || true
 RUN cp /etc/modules-load.d/anbox.conf /tmp/anbox.conf || true
 RUN cp /lib/udev/rules.d/99-anbox.rules /tmp/99-anbox.rules || true
-
 
 # -------------------------------------------------------------
 # Stage 3: AKMODS Extractor (if modules are not found directly in Stage 2)
@@ -76,21 +75,23 @@ RUN cp /tmp/bazzite_akmods/99-anbox.rules /final_extracted_modules/99-anbox.rule
 FROM ghcr.io/ublue-os/bluefin-dx:latest
 
 # Copy your build scripts from the ctx stage
-COPY --from=ctx /ctx /ctx # Correct syntax: copy /ctx from ctx stage to /ctx in this stage
+COPY --from=ctx /build_files /ctx # Correct syntax: copy /build_files from ctx stage to /ctx in this stage
 
 # Copy the extracted .ko modules and config files from previous stages
 # These will be copied to the /tmp/ of the main image, to be processed by build.sh
 # Check preference: modules found directly in bazzite_kernel_info stage take precedence.
-COPY --from=bazzite_kernel_info /tmp/binder_linux.ko /tmp/binder_linux.ko || true
-COPY --from=bazzite_kernel_info /tmp/ashmem_linux.ko /tmp/ashmem_linux.ko || true
+COPY --from=bazzite_kernel_info /tmp/binder_linux.ko /tmp/extracted_binder_linux.ko || true
+COPY --from=bazzite_kernel_info /tmp/ashmem_linux.ko /tmp/extracted_ashmem_linux.ko || true
 COPY --from=bazzite_kernel_info /tmp/anbox.conf /tmp/anbox.conf || true
 COPY --from=bazzite_kernel_info /tmp/99-anbox.rules /tmp/99-anbox.rules || true
 
 # If not found directly, try from akmods_extractor stage (this will only add if they didn't exist before)
-COPY --from=akmods_extractor /final_extracted_modules/ashmem_linux.ko /tmp/ashmem_linux.ko || true
-COPY --from=akmods_extractor /final_extracted_modules/binder_linux.ko /tmp/binder_linux.ko || true
+# It's IMPORTANT that the TARGET here is /tmp/<filename> so build.sh can process it.
+COPY --from=akmods_extractor /final_extracted_modules/ashmem_linux.ko /tmp/extracted_ashmem_linux.ko || true
+COPY --from=akmods_extractor /final_extracted_modules/binder_linux.ko /tmp/extracted_binder_linux.ko || true
 COPY --from=akmods_extractor /final_extracted_modules/anbox.conf /tmp/anbox.conf || true
 COPY --from=akmods_extractor /final_extracted_modules/99-anbox.rules /tmp/99-anbox.rules || true
+
 
 # Your original RUN directive, which calls build.sh
 # build.sh will find the copied .ko files in /tmp/
