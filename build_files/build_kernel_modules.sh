@@ -3,6 +3,13 @@ set -euxo pipefail
 
 echo "Starting build_kernel_modules.sh - Checking and potentially building kernel modules."
 
+# -------------------------------------------------------------
+# 1. Determine the exact kernel version of the base image (MUST BE FIRST)
+# -------------------------------------------------------------
+TARGET_KERNEL_VERSION=$(uname -r)
+echo "Target Kernel Version detected: ${TARGET_KERNEL_VERSION}"
+
+
 # --- Configuration ---
 REQUIRED_MODULES=(
     "binder_linux"
@@ -27,7 +34,7 @@ COMMON_BUILD_DEPS=(
     make
     gcc
     dkms
-    "kernel-devel-${TARGET_KERNEL_VERSION}" # This will now be correctly evaluated
+    "kernel-devel-${TARGET_KERNEL_VERSION}" # This will now be correctly evaluated because TARGET_KERNEL_VERSION is set above
 )
 
 ANBOX_MODULES_REPO_URL="https://github.com/choff/anbox-modules.git"
@@ -50,7 +57,6 @@ check_modules_present() {
 
 install_temp_build_deps() {
     echo "Installing temporary build dependencies for kernel modules..."
-    # REMOVED --force HERE
     rpm-ostree install --apply-live --allow-inactive "${COMMON_BUILD_DEPS[@]}"
     echo "Temporary build dependencies installed."
 }
@@ -75,16 +81,11 @@ fi
 
 echo "One or more kernel modules are missing. Proceeding with full module build."
 
-# 1. Determine the exact kernel version of the base image
-TARGET_KERNEL_VERSION=$(uname -r)
-echo "Target Kernel Version detected: ${TARGET_KERNEL_VERSION}"
-
-# Define the kernel source directory where kernel-devel installs headers
+# KERNEL_SOURCE_DIR definition moved to after TARGET_KERNEL_VERSION
 KERNEL_SOURCE_DIR="/usr/src/kernels/${TARGET_KERNEL_VERSION}"
 echo "DKMS will use kernel source directory: ${KERNEL_SOURCE_DIR}"
 
 # 2. Temporarily install general build tools AND kernel-devel
-# This time without --force.
 install_temp_build_deps
 
 # >>> Verify kernel source directory *again* after installation <<<
