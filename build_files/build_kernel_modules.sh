@@ -1,10 +1,11 @@
 #!/bin/bash
-set -euxo pipefail
+set -euxo pipefail # Strict error checking, unbound variables, echoing commands
 
 echo "Starting build_kernel_modules.sh - Checking and potentially building kernel modules."
 
 # -------------------------------------------------------------
 # 1. Determine the exact kernel version of the base image (MUST BE FIRST)
+#    This will now be a standard Fedora kernel (e.g., 6.14.x-300.fc42.x86_64)
 # -------------------------------------------------------------
 TARGET_KERNEL_VERSION=$(uname -r)
 echo "Target Kernel Version detected: ${TARGET_KERNEL_VERSION}"
@@ -28,25 +29,15 @@ DKMS_MODULE_VERSIONS=(
     "1"
 )
 
-# Common build dependencies for kernel modules (re-including skopeo and jq)
+# Common build dependencies for kernel modules
+# kernel-devel is now installed via rpm-ostree from standard repos.
 COMMON_BUILD_DEPS=(
     git
     make
     gcc
     dkms
-    skopeo # <-- Re-adding skopeo for pulling kernel-devel
-    jq     # <-- Re-adding jq for parsing manifest.json
+    "kernel-devel-${TARGET_KERNEL_VERSION}" # This package *will* now be found in standard repos
 )
-
-# Universal Blue's AKMODS image for fetching kernel-devel
-UBLUE_AKMODS_IMAGE="ghcr.io/ublue-os/akmods"
-# The 'coreos-stable' flavor is generally for main/hwe, but the tag structure is key.
-# From the skopeo list-tags, we see tags like "main-42-6.14.2-300.fc42.x86_64"
-# We need to extract the base kernel for that.
-# Let's try the *most recent generic Fedora 42 kernel* from the akmods list.
-# This is a HEURISTIC! It's not guaranteed to match the 'azure' kernel but is the closest
-# generic devel package provided by UBlue's akmods for F42.
-# We'll parse the highest versioned 'main-42' kernel tag from skopeo list-tags directly.
 
 ANBOX_MODULES_REPO_URL="https://github.com/choff/anbox-modules.git"
 ANBOX_MODULES_REPO_COMMIT="" # Or your specific compatible commit hash for this kernel
@@ -67,16 +58,16 @@ check_modules_present() {
 }
 
 install_temp_build_deps() {
-    echo "Installing temporary build dependencies for kernel modules (including skopeo and jq)..."
+    echo "Installing temporary build dependencies for kernel modules..."
+    # Using rpm-ostree install for all build deps, including kernel-devel
     rpm-ostree install --apply-live --allow-inactive "${COMMON_BUILD_DEPS[@]}"
     echo "Temporary build dependencies installed."
 }
 
 remove_temp_build_deps() {
     echo "Cleaning up temporary build dependencies..."
-    rpm-ostree override remove "${COMMON_BUILD_DEPS[@]}" \
-        "kernel-devel-${TARGET_KERNEL_VERSION}" \
-        || true
+    # Removing all build deps, including kernel-devel
+    rpm-ostree override remove "${COMMON_BUILD_DEPS[@]}" || true
     echo "Temporary build dependencies cleaned up."
 }
 
@@ -98,76 +89,16 @@ echo "One or more kernel modules are missing. Proceeding with full module build.
 KERNEL_SOURCE_DIR="/usr/src/kernels/${TARGET_KERNEL_VERSION}"
 echo "DKMS will use kernel source directory: ${KERNEL_SOURCE_DIR}"
 
-# 2. Temporarily install general build tools (NOW INCLUDING SKOPEO & JQ)
+
+# 2. Temporarily install general build tools AND kernel-devel from standard repos
 install_temp_build_deps
-
-# 2a. Fetch and Install the EXACT kernel-devel RPM for TARGET_KERNEL_VERSION
-echo "Attempting to fetch and install specific kernel-devel RPM using skopeo for ${TARGET_KERNEL_VERSION}..."
-KERNEL_RPM_DIR="/tmp/akmods_kernel_rpms"
-mkdir -p "${KERNEL_RPM_DIR}"
-
-# Determine the actual AKMODS tag. Since the Azure kernel is problematic,
-# let's try to pull the latest *generic* Fedora 42 kernel-devel available in akmods.
-# This assumes that the generic F42 kernel-devel *might* be compatible enough.
-# This is a workaround if the direct Azure kernel-devel is truly not available.
-UBLUE_AKMODS_TAG=""
-echo "Attempting to find the latest Fedora 42 generic kernel-devel tag from ${UBLUE_AKMODS_IMAGE}..."
-# This command pulls all tags, filters for 'main-42' (common generic stream),
-# and takes the one that looks like a full kernel version, then sorts numerically
-# and picks the highest.
-# This requires shuf and sort, which might not be in the build image, so this is risky.
-# Let's hardcode a recent generic Fedora 42 kernel from your skopeo list output as a fallback if dynamic fails.
-
-# Based on your provided skopeo list-tags, a common F42 generic kernel tag is:
-# main-42-6.14.x-300.fc42.x86_64
-# For the sake of moving forward, let's pick a specific one from your list.
-# For example, "main-42-6.14.4-300.fc42.x86_64" or the absolute latest.
-# Let's pick 'main-42-6.15.5-200.fc42.x86_64' or similar that you see.
-# The `ls -l /usr/src/kernels/` will still complain if the names don't match.
-# THIS IS THE MOST FRAGILE PART.
-UBLUE_AKMODS_TAG=$(skopeo list-tags docker://ghcr.io/ublue-os/akmods | \
-    jq -r '.Tags[]' | \
-    grep '^main-42-.*fc42.x86_64$' | \
-    grep -v '2025' | \
-    sort -V | tail -n 1)
-
-if [ -z "${UBLUE_AKMODS_TAG}" ]; then
-    echo "Warning: Could not dynamically determine a suitable generic main-42 kernel-devel tag. Falling back to a hardcoded recent one."
-    # Fallback to a hardcoded recent one from your list if dynamic parsing fails
-    UBLUE_AKMODS_TAG="main-42-6.15.6-200.fc42.x86_64" # Adjust to the *latest* you see for F42
-fi
-
-echo "Attempting to pull UBlue AKMODS image with inferred tag: ${UBLUE_AKMODS_TAG}"
-
-skopeo copy --retry-times 3 "docker://${UBLUE_AKMODS_IMAGE}:${UBLUE_AKMODS_TAG}" "dir:${KERNEL_RPM_DIR}"
-
-# Extract the RPMs (especially kernel-devel) from the tarball
-AKMODS_TARGZ_DIGEST=$(jq -r '.layers[].digest' <"${KERNEL_RPM_DIR}/manifest.json" | cut -d : -f 2)
-tar -xvzf "${KERNEL_RPM_DIR}/${AKMODS_TARGZ_DIGEST}" -C "${KERNEL_RPM_DIR}"/
-
-# Move content to expected location within KERNEL_RPM_DIR
-if [ -d "${KERNEL_RPM_DIR}/rpms" ]; then
-    mv "${KERNEL_RPM_DIR}/rpms"/* "${KERNEL_RPM_DIR}/"
-fi
-
-# Install the specific kernel-devel RPM
-# Note: We're installing a specific kernel-devel from the AKMODS repo,
-# which might be for a *different* kernel than TARGET_KERNEL_VERSION (6.11.0-azure).
-# This is a compatibility gamble.
-echo "Installing kernel-devel RPM: ${KERNEL_RPM_DIR}/kernel-devel-*.rpm"
-# Use a wildcard here, as the kernel-devel RPM name will match the UBLUE_AKMODS_TAG kernel,
-# not necessarily TARGET_KERNEL_VERSION.
-dnf5 install -y "${KERNEL_RPM_DIR}/kernel-devel-*.rpm"
-echo "Specific kernel-devel RPM installed."
-
 
 # >>> Verify kernel source directory *after* installation <<<
 echo "Verifying kernel source directory contents AFTER kernel-devel installation:"
 ls -l "${KERNEL_SOURCE_DIR}" || true
 if [ ! -d "${KERNEL_SOURCE_DIR}" ] || [ -z "$(ls -A "${KERNEL_SOURCE_DIR}")" ]; then
     echo "CRITICAL ERROR: Kernel source directory ${KERNEL_SOURCE_DIR} is still empty or does NOT exist after attempting installation!"
-    echo "This indicates a fundamental issue. The generic kernel-devel might not match the Azure kernel."
-    echo "Current contents of /usr/src/kernels/: $(ls -l /usr/src/kernels/ || true)"
+    echo "This indicates a fundamental issue with kernel-devel package. Cannot proceed."
     exit 1 # Exit with error, as this is unrecoverable without headers
 fi
 
@@ -205,7 +136,6 @@ for i in "${!ANBOX_SOURCE_DIRS[@]}"; do
     TEMP_SRC_DIRS+=("${MODULE_PATH}")
 
     echo "Attempting DKMS build for ${DKMS_NAME}/${DKMS_VERSION} (verbose output follows)..."
-    # Provide the --kernelsourcedir explicitly
     dkms build "${DKMS_NAME}/${DKMS_VERSION}" --kernelsourcedir "${KERNEL_SOURCE_DIR}" --arch x86_64 --verbose
     
     BUILD_LOG_PATH="/var/lib/dkms/${DKMS_NAME}/${DKMS_VERSION}/build/make.log"
@@ -242,7 +172,6 @@ rm -rf "${ANBOX_MODULES_REPO_DIR}"
 for dir in "${TEMP_SRC_DIRS[@]}"; do
     rm -rf "${dir}"
 done
-rm -rf "${KERNEL_RPM_DIR}" # Clean up the pulled akmods content
 echo "Source directories cleaned up."
 
 echo "build_kernel_modules.sh finished (completed build)."
