@@ -49,13 +49,18 @@ check_modules_present() {
 
 install_temp_build_deps() {
     echo "Installing temporary build dependencies for kernel modules..."
-    dnf5 install -y "${COMMON_BUILD_DEPS[@]}"
+    # NOW RE-INCLUDING KERNEL-DEVEL!
+    dnf5 install -y "${COMMON_BUILD_DEPS[@]}" \
+        "kernel-devel-${TARGET_KERNEL_VERSION}" # This should provide headers in the right place
     echo "Temporary build dependencies installed."
 }
 
 remove_temp_build_deps() {
     echo "Cleaning up temporary build dependencies..."
-    dnf5 remove -y "${COMMON_BUILD_DEPS[@]}" || true
+    # NOW RE-INCLUDING KERNEL-DEVEL IN REMOVE!
+    dnf5 remove -y "${COMMON_BUILD_DEPS[@]}" \
+        "kernel-devel-${TARGET_KERNEL_VERSION}" \
+        || true
     echo "Temporary build dependencies cleaned up."
 }
 
@@ -77,7 +82,7 @@ echo "One or more kernel modules are missing. Proceeding with full module build.
 TARGET_KERNEL_VERSION=$(uname -r)
 echo "Target Kernel Version detected: ${TARGET_KERNEL_VERSION}"
 
-# 2. Temporarily install general build tools (kernel headers/devel are already there)
+# 2. Temporarily install general build tools AND kernel-devel
 install_temp_build_deps
 
 # 3. Clone Kernel Modules source
@@ -105,9 +110,9 @@ for i in "${!ANBOX_SOURCE_DIRS[@]}"; do
     cp -rT "${SOURCE_DIR}" "${MODULE_PATH}"
     TEMP_SRC_DIRS+=("${MODULE_PATH}")
 
-    # REMOVED --kernel "${TARGET_KERNEL_VERSION}" from dkms build
+    # Rely on DKMS to find the headers via kernel-devel symlinks for the running kernel
     dkms build "${DKMS_NAME}/${DKMS_VERSION}" --arch x86_64
-    dkms install "${DKMS_NAME}/${DKMS_VERSION}" # No --kernel here either
+    dkms install "${DKMS_NAME}/${DKMS_VERSION}"
 done
 echo "All specified kernel modules built and installed via DKMS."
 
