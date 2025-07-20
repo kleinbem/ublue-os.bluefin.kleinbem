@@ -21,11 +21,14 @@ DKMS_MODULE_VERSIONS=(
     "1"
 )
 
+# Common build dependencies for kernel modules (excluding kernel-headers/devel which are from base)
 COMMON_BUILD_DEPS=(
     git
     make
     gcc
     dkms
+    # skopeo # Removed skopeo and jq from here as kernel-devel is already installed by the base
+    # jq
     # Add any other universally required build dependencies here (e.g., flex, bison, libelf-devel)
 )
 
@@ -49,18 +52,15 @@ check_modules_present() {
 
 install_temp_build_deps() {
     echo "Installing temporary build dependencies for kernel modules..."
-    # NOW RE-INCLUDING KERNEL-DEVEL!
-    dnf5 install -y "${COMMON_BUILD_DEPS[@]}" \
-        "kernel-devel-${TARGET_KERNEL_VERSION}" # This should provide headers in the right place
+    # Only install general build tools. kernel-devel is ALREADY PRESENT in the base image.
+    dnf5 install -y "${COMMON_BUILD_DEPS[@]}"
     echo "Temporary build dependencies installed."
 }
 
 remove_temp_build_deps() {
     echo "Cleaning up temporary build dependencies..."
-    # NOW RE-INCLUDING KERNEL-DEVEL IN REMOVE!
-    dnf5 remove -y "${COMMON_BUILD_DEPS[@]}" \
-        "kernel-devel-${TARGET_KERNEL_VERSION}" \
-        || true
+    # Only remove general build tools.
+    dnf5 remove -y "${COMMON_BUILD_DEPS[@]}" || true
     echo "Temporary build dependencies cleaned up."
 }
 
@@ -82,7 +82,11 @@ echo "One or more kernel modules are missing. Proceeding with full module build.
 TARGET_KERNEL_VERSION=$(uname -r)
 echo "Target Kernel Version detected: ${TARGET_KERNEL_VERSION}"
 
-# 2. Temporarily install general build tools AND kernel-devel
+# Define the kernel source directory where kernel-devel installs headers
+KERNEL_SOURCE_DIR="/usr/src/kernels/${TARGET_KERNEL_VERSION}"
+echo "DKMS will use kernel source directory: ${KERNEL_SOURCE_DIR}"
+
+# 2. Temporarily install general build tools
 install_temp_build_deps
 
 # 3. Clone Kernel Modules source
@@ -110,8 +114,10 @@ for i in "${!ANBOX_SOURCE_DIRS[@]}"; do
     cp -rT "${SOURCE_DIR}" "${MODULE_PATH}"
     TEMP_SRC_DIRS+=("${MODULE_PATH}")
 
-    # Rely on DKMS to find the headers via kernel-devel symlinks for the running kernel
-    dkms build "${DKMS_NAME}/${DKMS_VERSION}" --arch x86_64
+    # Build using --kernelsourcedir to point DKMS directly to headers
+    # Removed --arch x86_64 as it's often implied or not needed by DKMS if on correct arch
+    dkms build "${DKMS_NAME}/${DKMS_VERSION}" --kernelsourcedir "${KERNEL_SOURCE_DIR}"
+    # Install the built modules
     dkms install "${DKMS_NAME}/${DKMS_VERSION}"
 done
 echo "All specified kernel modules built and installed via DKMS."
