@@ -1,5 +1,5 @@
 #!/bin/bash
-set -euxo pipefail # Strict error checking, unbound variables, echoing commands
+set -euxo pipefail
 
 echo "Starting build_kernel_modules.sh - Copying pre-built Waydroid kernel modules."
 
@@ -8,7 +8,7 @@ echo "Starting build_kernel_modules.sh - Copying pre-built Waydroid kernel modul
 #    This is your problematic 6.11.0-1018-azure kernel.
 # -------------------------------------------------------------
 TARGET_KERNEL_VERSION=$(uname -r)
-echo "Target Kernel Version detected: ${TARGET_KERNEL_VERSION}"
+echo "Target Running Kernel Version detected: ${TARGET_KERNEL_VERSION}"
 
 # --- Configuration ---
 REQUIRED_MODULES=(
@@ -65,11 +65,16 @@ depmod -a "${TARGET_KERNEL_VERSION}"
 echo "depmod complete."
 
 # -------------------------------------------------------------
-# 4. Install configuration files
+# 4. Install configuration files (assuming these are in your build_files/ directory
+#    and you copy them in your Containerfile, similar to the modules).
 # -------------------------------------------------------------
 echo "Installing Anbox configuration files..."
-cp /tmp/anbox.conf /etc/modules-load.d/
-cp /tmp/99-anbox.rules /lib/udev/rules.d/
+# You'd need to copy these from your build_files directory in the Containerfile.
+# For example: COPY build_files/anbox.conf /tmp/anbox.conf
+# Then: cp /tmp/anbox.conf /etc/modules-load.d/
+# For simplicity here, let's assume they are already in the root of /ctx from the build_files copy.
+cp /ctx/anbox.conf /etc/modules-load.d/
+cp /ctx/99-anbox.rules /lib/udev/rules.d/
 echo "Anbox configuration files installed."
 
 # -------------------------------------------------------------
