@@ -1,6 +1,7 @@
 # Stage 1: Context for build scripts (always at the top)
 FROM scratch AS ctx
-COPY build_files /build_files # Copy build_files content to /build_files in ctx stage. This makes path /ctx/build_files/my_script
+COPY build_files /build_files
+# Copy build_files content to /build_files in ctx stage. This makes path /ctx/build_files/my_script
 
 # -------------------------------------------------------------
 # Stage 2: Bazzite Base for Kernel Version & Initial Module Path Check
@@ -75,7 +76,7 @@ RUN cp /tmp/bazzite_akmods/99-anbox.rules /final_extracted_modules/99-anbox.rule
 FROM ghcr.io/ublue-os/bluefin-dx:latest
 
 # Copy your build scripts from the ctx stage
-COPY --from=ctx /build_files /ctx # Correct syntax: copy /build_files from ctx stage to /ctx in this stage
+COPY --from=ctx /build_files /ctx # Corrected syntax: copy /build_files from ctx stage to /ctx in this stage
 
 # Copy the extracted .ko modules and config files from previous stages
 # These will be copied to the /tmp/ of the main image, to be processed by build.sh
