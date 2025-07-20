@@ -3,13 +3,6 @@ set -euxo pipefail
 
 echo "Starting build_kernel_modules.sh - Checking and potentially building kernel modules."
 
-# -------------------------------------------------------------
-# 1. Determine the exact kernel version of the base image
-#    Moved this up so TARGET_KERNEL_VERSION is defined before COMMON_BUILD_DEPS.
-# -------------------------------------------------------------
-TARGET_KERNEL_VERSION=$(uname -r)
-echo "Target Kernel Version detected: ${TARGET_KERNEL_VERSION}"
-
 # --- Configuration ---
 REQUIRED_MODULES=(
     "binder_linux"
@@ -41,7 +34,7 @@ ANBOX_MODULES_REPO_URL="https://github.com/choff/anbox-modules.git"
 ANBOX_MODULES_REPO_COMMIT="" # Or your specific commit hash
 
 # --- Functions ---
-# ... (all functions remain the same) ...
+
 check_modules_present() {
     local modules_missing=false
     for module in "${REQUIRED_MODULES[@]}"; do
@@ -57,7 +50,8 @@ check_modules_present() {
 
 install_temp_build_deps() {
     echo "Installing temporary build dependencies for kernel modules..."
-    rpm-ostree install --apply-live --allow-inactive --force "${COMMON_BUILD_DEPS[@]}"
+    # REMOVED --force HERE
+    rpm-ostree install --apply-live --allow-inactive "${COMMON_BUILD_DEPS[@]}"
     echo "Temporary build dependencies installed."
 }
 
@@ -66,8 +60,6 @@ remove_temp_build_deps() {
     rpm-ostree override remove "${COMMON_BUILD_DEPS[@]}" || true
     echo "Temporary build dependencies cleaned up."
 }
-# --- End Functions ---
-
 
 # --- Main Logic ---
 
@@ -83,16 +75,20 @@ fi
 
 echo "One or more kernel modules are missing. Proceeding with full module build."
 
-# The TARGET_KERNEL_VERSION is now defined.
-echo "DKMS will use kernel source directory: /usr/src/kernels/${TARGET_KERNEL_VERSION}"
-KERNEL_SOURCE_DIR="/usr/src/kernels/${TARGET_KERNEL_VERSION}" # Define it here too for clarity
+# 1. Determine the exact kernel version of the base image
+TARGET_KERNEL_VERSION=$(uname -r)
+echo "Target Kernel Version detected: ${TARGET_KERNEL_VERSION}"
 
+# Define the kernel source directory where kernel-devel installs headers
+KERNEL_SOURCE_DIR="/usr/src/kernels/${TARGET_KERNEL_VERSION}"
+echo "DKMS will use kernel source directory: ${KERNEL_SOURCE_DIR}"
 
 # 2. Temporarily install general build tools AND kernel-devel
+# This time without --force.
 install_temp_build_deps
 
 # >>> Verify kernel source directory *again* after installation <<<
-echo "Verifying kernel source directory contents AFTER forced install:"
+echo "Verifying kernel source directory contents AFTER installation:"
 ls -l "${KERNEL_SOURCE_DIR}" || true
 if [ ! -d "${KERNEL_SOURCE_DIR}" ] || [ -z "$(ls -A "${KERNEL_SOURCE_DIR}")" ]; then
     echo "CRITICAL ERROR: Kernel source directory ${KERNEL_SOURCE_DIR} is still empty or does NOT exist after attempting installation!"
