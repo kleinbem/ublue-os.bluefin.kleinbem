@@ -1,102 +1,139 @@
-# Stage 1: Context for all build-related files (scripts, configs, etc.)
-# Bypassing problematic COPY from local context by cloning from GitHub.
-FROM alpine/git:latest AS ctx # Use alpine:latest base with git client pre-installed
-
-# Hardcode your GitHub repository URL for cloning build_files.
-ARG YOUR_GITHUB_REPO_URL="https://github.com/kleinbem/ublue-os.bluefin.kleinbem.git"
-ARG YOUR_REPO_BRANCH="main" # Or your specific branch name
-
-# Clone only the build_files directory to avoid cloning the entire repo.
-# This requires git's sparse-checkout feature, which might be overkill but is precise.
-RUN mkdir -p /tmp/repo_clone && cd /tmp/repo_clone && \
-    git init && \
-    git remote add origin ${YOUR_GITHUB_REPO_URL} && \
-    git config core.sparsecheckout true && \
-    echo "build_files/" >> .git/info/sparse-checkout && \
-    git pull --depth 1 origin ${YOUR_REPO_BRANCH}
-
-# Copy the build_files from the cloned repo into /ctx_data/ in this stage.
-COPY --from=ctx /tmp/repo_clone/build_files/ /ctx_data/ # Now copy from known clone path
-
-# (Rest of Containerfile is the same as previous successful version)
-# -------------------------------------------------------------
-# Stage 2: Bazzite Kernel Info - Get Bazzite's precise kernel version
-# -------------------------------------------------------------
-FROM ghcr.io/ublue-os/bazzite:latest AS bazzite_kernel_info
-
-# Get Bazzite's kernel version and save it to a file.
-RUN KERNEL_VERSION_FOR_BAZZITE=$(uname -r) && echo "${KERNEL_VERSION_FOR_BAZZITE}" > /tmp/kernel_version_bazzite.txt
-
-# Attempt to find pre-existing .ko files within this base image.
-RUN find /usr/lib/modules/ -name "binder_linux.ko" -exec cp {} /tmp/binder_linux.ko \; || true
-RUN find /usr/lib/modules/ -name "ashmem_linux.ko" -exec cp {} /tmp/ashmem_linux.ko \; || true
-
-
-# -------------------------------------------------------------
-# Stage 3: AKMODS Extractor - Pull and extract .ko files from Bazzite's AKMODS image
-# -------------------------------------------------------------
-FROM fedora:latest AS akmods_extractor # Use a minimal fedora image with necessary tools
-
-# Install tools needed for skopeo and RPM extraction
-RUN dnf install -y skopeo jq tar gzip rpm-build \
-    && dnf clean all && rm -rf /var/cache/dnf
-
-# Copy the Bazzite kernel version from Stage 2.
-COPY --from=bazzite_kernel_info /tmp/kernel_version_bazzite.txt /tmp/kernel_version_bazzite.txt
-
-# Dynamically set variables and execute skopeo within a single RUN command
-RUN KERNEL_VERSION_FOR_BAZZITE=$(cat /tmp/kernel_version_bazzite.txt) && \
-    BAZZITE_FEDORA_VERSION=$(echo "${KERNEL_VERSION_FOR_BAZZITE}" | sed -E 's/.*fc([0-9]+)\.x86_64/\1/') && \
-    AKMODS_TAG_FOR_BAZZITE="bazzite-${BAZZITE_FEDORA_VERSION}-${KERNEL_VERSION_FOR_BAZZITE}" && \
-    UBLUE_AKMODS_IMAGE="ghcr.io/ublue-os/akmods" && \
-    \
-    echo "Attempting to pull AKMODS image: ${UBLUE_AKMODS_IMAGE}:${AKMODS_TAG_FOR_BAZZITE}" && \
-    mkdir -p /tmp/bazzite_akmods && \
-    skopeo copy --retry-times 3 "docker://${UBLUE_AKMODS_IMAGE}:${AKMODS_TAG_FOR_BAZZITE}" "dir:/tmp/bazzite_akmods" \
-    || (echo "Warning: Failed to pull AKMODS image ${UBLUE_AKMODS_IMAGE}:${AKMODS_TAG_FOR_BAZZITE}. Modules might be built-in or not available in akmods." && exit 0) && \
-    \
-    AKMODS_TARGZ_DIGEST=$(jq -r '.layers[].digest' </tmp/bazzite_akmods/manifest.json | cut -d : -f 2) && \
-    tar -xvzf "/tmp/bazzite_akmods/${AKMODS_TARGZ_DIGEST}" -C "/tmp/bazzite_akmods/" && \
-    \
-    mkdir -p /extracted_rpms/ && \
-    find /tmp/bazzite_akmods/rpms/kmods/ -name "*.rpm" -exec mv {} /extracted_rpms/ \; && \
-    \
-    # Now, extract the .ko files from these kmod RPMs using rpm2cpio
-    mkdir -p /final_extracted_modules/usr/lib/modules/${KERNEL_VERSION_FOR_BAZZITE}/extra/ && \
-    for rpm in /extracted_rpms/*.rpm; do rpm2cpio "$rpm" | cpio -idmv --quiet --to-stdout | tar x -C /final_extracted_modules/; done \
-    && cp /final_extracted_modules/usr/lib/modules/${KERNEL_VERSION_FOR_BAZZITE}/extra/ashmem_linux.ko /final_extracted_modules/ashmem_linux.ko \
-    && cp /final_extracted_modules/usr/lib/modules/${KERNEL_VERSION_FOR_BAZZITE}/extra/binder_linux.ko /final_extracted_modules/binder_linux.ko \
-    || true
-
-
-# -------------------------------------------------------------
-# Stage 4: Your Main Custom Bluefin-DX Image Build
-# -------------------------------------------------------------
+# Your custom Bluefin-DX Image
 FROM ghcr.io/ublue-os/bluefin-dx:latest
 
-# Copy your build scripts from the ctx stage
-COPY --from=ctx /ctx_data/build_files /ctx/build_files
-
-# Copy the extracted .ko modules and config files from previous stages to /tmp/ in the main image.
-COPY --from=bazzite_module_source /tmp/binder_linux.ko /tmp/extracted_binder_linux.ko || true
-COPY --from=bazzite_module_source /tmp/ashmem_linux.ko /tmp/extracted_ashmem_linux.ko || true
-
-# Config files from ctx stage (where they are copied from your local build_files/)
-COPY --from=ctx /ctx_data/anbox.conf /tmp/anbox.conf || true
-COPY --from=ctx /ctx_data/99-anbox.rules /tmp/99-anbox.rules || true
-
-# If not found directly, try from akmods_extractor stage
-COPY --from=akmods_extractor /final_extracted_modules/ashmem_linux.ko /tmp/extracted_ashmem_linux.ko || true
-COPY --from=akmods_extractor /final_extracted_modules/binder_linux.ko /tmp/extracted_binder_linux.ko || true
+# The GITHUB_WORKSPACE variable, needed for our build_files location.
+# This should be injected by GitHub Actions workflow.
+ARG GITHUB_WORKSPACE="/home/runner/work/ublue-os.bluefin.kleinbem/ublue-os.bluefin.kleinbem"
 
 
-# Your main RUN directive, which calls build.sh
-RUN --mount=type=bind,from=ctx,source=/ctx/build_files,target=/ctx/build_files \
-    --mount=type=cache,dst=/var/cache \
+# Your main RUN directive, now containing all logic from build.sh AND build_kernel_modules.sh
+# Also mounts cache and tmp for efficiency.
+RUN --mount=type=cache,dst=/var/cache \
     --mount=type=cache,dst=/var/log \
     --mount=type=tmpfs,dst=/tmp \
-    /ctx/build_files/build.sh && \
-    ostree container commit
+    bash -c ' \
+        # --- Start of Original build.sh content --- \
+        set -euxo pipefail; \
+        \
+        echo "--- DEBUG INFO START (from main build.sh monolith) ---"; \
+        echo "Current working directory: $(pwd)"; \
+        echo "Contents of /: $(ls -la /)"; \
+        echo "Contents of /etc/os-release: $(cat /etc/os-release || true)"; \
+        echo "Contents of /usr/lib/ostree-release: $(cat /usr/lib/ostree-release || true)"; \
+        echo "Running kernel version (uname -r): $(uname -r)"; \
+        echo "Path to uname: $(which uname || true)"; \
+        echo "Path to rpm: $(which rpm || true)"; \
+        echo "Path to dnf5: $(which dnf5 || true)"; \
+        echo "Path to rpm-ostree: $(which rpm-ostree || true)"; \
+        echo "--- DEBUG INFO END (from main build.sh monolith) ---"; \
+        \
+        # ------------------------------------------------------------- \
+        # Now, embed the entire content of build_kernel_modules.sh here. \
+        # This will need all its variables and logic. \
+        # ------------------------------------------------------------- \
+        echo "Starting embedded kernel module extraction and setup." ; \
+        \
+        # --- Embedded build_kernel_modules.sh logic --- \
+        TARGET_KERNEL_VERSION_FOR_RUNNING_KERNEL=$(uname -r); \
+        echo "Target Running Kernel Version detected: ${TARGET_KERNEL_VERSION_FOR_RUNNING_KERNEL}"; \
+        \
+        REQUIRED_MODULES=("binder_linux" "ashmem_linux"); \
+        BAZZITE_KERNEL_VERSION_FOR_EXTRACTION="6.15.6-103.bazzite.fc42.x86_64"; \
+        BAZZITE_FEDORA_VERSION_FOR_EXTRACTION="42"; \
+        AKMODS_TAG_FOR_BAZZITE="bazzite-${BAZZITE_FEDORA_VERSION_FOR_EXTRACTION}-${BAZZITE_KERNEL_VERSION_FOR_EXTRACTION}"; \
+        UBLUE_AKMODS_IMAGE="ghcr.io/ublue-os/akmods"; \
+        \
+        # Functions need to be defined *before* they are called in this monolithic script \
+        check_modules_present() { \
+            local modules_missing=false; \
+            local current_running_kernel=$(uname -r); \
+            echo "  (Internal) Current running kernel for modprobe check: ${current_running_kernel}"; \
+            for module in "${REQUIRED_MODULES[@]}"; do \
+                if ! modprobe -n "${module}" &>/dev/null; then \
+                    echo "  - ${module} module not found."; \
+                    modules_missing=true; \
+                else \
+                    echo "  - ${module} module found."; \
+                fi; \
+            done; \
+            echo "${modules_missing}"; \
+        }; \
+        \
+        echo "Checking if all required kernel modules are already available on current system..."; \
+        MODULES_STILL_MISSING=$(check_modules_present); \
+        \
+        if [ "${MODULES_STILL_MISSING}" = "false" ]; then \
+            echo "All required kernel modules are present. Skipping module build/copy process."; \
+            echo "build_kernel_modules.sh finished (skipped)."; \
+        else \
+            echo "One or more kernel modules are missing. Proceeding with module extraction and installation."; \
+            \
+            echo "Installing temporary tools: skopeo, jq, tar, gzip, rpm-build..."; \
+            dnf5 install -y skopeo jq tar gzip rpm-build; \
+            echo "Temporary tools installed."; \
+            \
+            echo "Fetching Bazzite AKMODS image: ${UBLUE_AKMODS_IMAGE}:${AKMODS_TAG_FOR_BAZZITE}"; \
+            KERNEL_RPM_DIR="/tmp/bazzite_akmods_content"; \
+            mkdir -p "${KERNEL_RPM_DIR}"; \
+            \
+            skopeo copy --retry-times 3 "docker://${UBLUE_AKMODS_IMAGE}:${AKMODS_TAG_FOR_BAZZITE}" "dir:${KERNEL_RPM_DIR}" \
+                || (echo "CRITICAL ERROR: Failed to pull AKMODS image. Cannot proceed." && exit 1); \
+            \
+            echo "Extracting RPMs from pulled AKMODS content..."; \
+            AKMODS_TARGZ_DIGEST=$(jq -r '.layers[].digest' <"${KERNEL_RPM_DIR}/manifest.json" | cut -d : -f 2); \
+            tar -xvzf "${KERNEL_RPM_DIR}/${AKMODS_TARGZ_DIGEST}" -C "${KERNEL_RPM_DIR}"/; \
+            \
+            echo "Moving extracted kmod RPMs for processing..."; \
+            EXTRACTED_RPMS_DIR="${KERNEL_RPM_DIR}/extracted_rpms"; \
+            mkdir -p "${EXTRACTED_RPMS_DIR}"; \
+            find "${KERNEL_RPM_DIR}/rpms/kmods/" -name "*.rpm" -exec mv {} "${EXTRACTED_RPMS_DIR}/" \;; \
+            \
+            TEMP_KO_EXTRACT_DIR="/tmp/temp_ko_extract"; \
+            mkdir -p "${TEMP_KO_EXTRACT_DIR}"; \
+            echo "Extracting .ko files from kmod RPMs using rpm2cpio..."; \
+            for rpm in "${EXTRACTED_RPMS_DIR}"/*.rpm; do \
+                echo "  - Processing RPM: $(basename "$rpm")"; \
+                rpm2cpio "$rpm" | cpio -idmv --quiet -D "${TEMP_KO_EXTRACT_DIR}" \
+                || (echo "Warning: Failed to extract modules from $(basename "$rpm")." || true); \
+            done; \
+            echo ".ko files extracted to temporary directory."; \
+            \
+            MODULE_FINAL_DEST_DIR="/usr/lib/modules/${TARGET_RUNNING_KERNEL_VERSION}/extra"; \
+            mkdir -p "${MODULE_FINAL_DEST_DIR}"; \
+            echo "Copying extracted .ko files to final destination: ${MODULE_FINAL_DEST_DIR}..."; \
+            cp "${TEMP_KO_EXTRACT_DIR}/usr/lib/modules/${BAZZITE_KERNEL_VERSION_FOR_EXTRACTION}/extra/ashmem_linux.ko" "${MODULE_FINAL_DEST_DIR}/" \
+                || (echo "ERROR: Failed to copy ashmem_linux.ko to final location!" && exit 1); \
+            cp "${TEMP_KO_EXTRACT_DIR}/usr/lib/modules/${BAZZITE_KERNEL_VERSION_FOR_EXTRACTION}/extra/binder_linux.ko" "${MODULE_FINAL_DEST_DIR}/" \
+                || (echo "ERROR: Failed to copy binder_linux.ko to final location!" && exit 1); \
+            echo ".ko files copied."; \
+            \
+            echo "Running depmod -a..."; \
+            depmod -a "${TARGET_RUNNING_KERNEL_VERSION}"; \
+            echo "depmod complete."; \
+            \
+            echo "Cleaning up temporary tools and extracted content..."; \
+            dnf5 remove -y skopeo jq tar gzip rpm-build || true; \
+            rm -rf "${KERNEL_RPM_DIR}" "${TEMP_KO_EXTRACT_DIR}"; \
+            echo "Cleanup complete."; \
+            \
+            echo "build_kernel_modules.sh finished (completed module extraction and installation)."; \
+        fi; \
+        # --- End of Embedded build_kernel_modules.sh logic --- \
+        \
+        echo "Creating /etc/modules-load.d/anbox.conf..."; \
+        tee /etc/modules-load.d/anbox.conf <<EOF_ANBOX_CONF \n ashmem_linux \n binder_linux \n EOF_ANBOX_CONF \n echo "anbox.conf created."; \
+        \
+        echo "Creating /lib/udev/rules.d/99-anbox.rules..."; \
+        tee /lib/udev/rules.d/99-anbox.rules <<EOF_UDEV_RULES \n # Anbox \n KERNEL=="binder", MODE="0666" \n KERNEL=="ashmem", MODE="0666" \n EOF_UDEV_RULES \n echo "99-anbox.rules created."; \
+        \
+        echo "Installing main packages..."; \
+        dnf5 install -y tmux waydroid lxc; \
+        echo "Waydroid application and its user-space dependencies installed."; \
+        \
+        echo "Running rpm-ostree cleanup..."; \
+        rpm-ostree cleanup -m; \
+        echo "Main build.sh finished."; \
+    ' && ostree container commit
     
 ### LINTING
 ## Verify final image and contents are correct.
