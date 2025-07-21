@@ -1,9 +1,24 @@
 # Stage 1: Context for all build-related files (scripts, configs, etc.)
-FROM alpine:latest AS ctx
-# Copy the local 'build_files' directory into /ctx_data/build_files in this stage.
-COPY build_files /ctx_data/build_files/ # Target now explicit subdir within /ctx_data/
+# Bypassing problematic COPY from local context by cloning from GitHub.
+FROM alpine/git:latest AS ctx # Use alpine:latest base with git client pre-installed
 
+# Hardcode your GitHub repository URL for cloning build_files.
+ARG YOUR_GITHUB_REPO_URL="https://github.com/kleinbem/ublue-os.bluefin.kleinbem.git"
+ARG YOUR_REPO_BRANCH="main" # Or your specific branch name
 
+# Clone only the build_files directory to avoid cloning the entire repo.
+# This requires git's sparse-checkout feature, which might be overkill but is precise.
+RUN mkdir -p /tmp/repo_clone && cd /tmp/repo_clone && \
+    git init && \
+    git remote add origin ${YOUR_GITHUB_REPO_URL} && \
+    git config core.sparsecheckout true && \
+    echo "build_files/" >> .git/info/sparse-checkout && \
+    git pull --depth 1 origin ${YOUR_REPO_BRANCH}
+
+# Copy the build_files from the cloned repo into /ctx_data/ in this stage.
+COPY --from=ctx /tmp/repo_clone/build_files/ /ctx_data/ # Now copy from known clone path
+
+# (Rest of Containerfile is the same as previous successful version)
 # -------------------------------------------------------------
 # Stage 2: Bazzite Kernel Info - Get Bazzite's precise kernel version
 # -------------------------------------------------------------
@@ -26,7 +41,7 @@ FROM fedora:latest AS akmods_extractor # Use a minimal fedora image with necessa
 RUN dnf install -y skopeo jq tar gzip rpm-build \
     && dnf clean all && rm -rf /var/cache/dnf
 
-# Copy the BAZZITE_KERNEL_VERSION from the bazzite_kernel_info stage
+# Copy the Bazzite kernel version from Stage 2.
 COPY --from=bazzite_kernel_info /tmp/kernel_version_bazzite.txt /tmp/kernel_version_bazzite.txt
 
 # Dynamically set variables and execute skopeo within a single RUN command
@@ -60,7 +75,7 @@ RUN KERNEL_VERSION_FOR_BAZZITE=$(cat /tmp/kernel_version_bazzite.txt) && \
 FROM ghcr.io/ublue-os/bluefin-dx:latest
 
 # Copy your build scripts from the ctx stage
-COPY --from=ctx /ctx_data /ctx/build_files
+COPY --from=ctx /ctx_data/build_files /ctx/build_files
 
 # Copy the extracted .ko modules and config files from previous stages to /tmp/ in the main image.
 COPY --from=bazzite_module_source /tmp/binder_linux.ko /tmp/extracted_binder_linux.ko || true
