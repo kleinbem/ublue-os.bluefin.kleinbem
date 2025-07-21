@@ -1,31 +1,7 @@
 # Stage 1: Context for all build-related files (scripts, configs, etc.)
 FROM alpine:latest AS ctx
-
-# We need the GITHUB_WORKSPACE environment variable which holds the path to the repo.
-# This is injected by GitHub Actions, but we need to pass it into the build.
-ARG GITHUB_WORKSPACE="/home/runner/work/ublue-os.bluefin.kleinbem/ublue-os.bluefin.kleinbem"
-
-# --- DEBUG START: Verify contents of build context ---
-RUN echo "--- DEBUG: GITHUB_WORKSPACE is ${GITHUB_WORKSPACE} ---"
-RUN echo "--- DEBUG: Contents of GITHUB_WORKSPACE ---"
-RUN ls -la "${GITHUB_WORKSPACE}" || echo "Error: GITHUB_WORKSPACE does not exist or is not readable."
-RUN echo "--- DEBUG: Contents of ${GITHUB_WORKSPACE}/build_files ---"
-RUN ls -la "${GITHUB_WORKSPACE}/build_files/" || echo "Error: build_files/ in GITHUB_WORKSPACE not found."
-RUN echo "--- END DEBUG ---"
-# --- DEBUG END ---
-
-# Copy the entire contents of your local 'build_files' directory into /ctx_data/ in this stage.
-# Use absolute path from GITHUB_WORKSPACE as source.
-COPY "${GITHUB_WORKSPACE}/build_files/" /ctx_data/ # <-- ABSOLUTE SOURCE PATH HERE
-
-
-# --- DEBUG START: Verify contents AFTER COPY ---
-RUN echo "--- DEBUG: Contents of / in ctx stage AFTER COPY ---"
-RUN ls -la /
-RUN echo "--- DEBUG: Contents of /ctx_data/ in ctx stage AFTER COPY ---"
-RUN ls -la /ctx_data/
-RUN echo "--- END DEBUG ---"
-# --- DEBUG END ---
+# Copy the local 'build_files' directory into /ctx_data/build_files in this stage.
+COPY build_files /ctx_data/build_files/ # Target now explicit subdir within /ctx_data/
 
 
 # -------------------------------------------------------------
@@ -50,7 +26,7 @@ FROM fedora:latest AS akmods_extractor # Use a minimal fedora image with necessa
 RUN dnf install -y skopeo jq tar gzip rpm-build \
     && dnf clean all && rm -rf /var/cache/dnf
 
-# Copy the Bazzite kernel version from Stage 2.
+# Copy the BAZZITE_KERNEL_VERSION from the bazzite_kernel_info stage
 COPY --from=bazzite_kernel_info /tmp/kernel_version_bazzite.txt /tmp/kernel_version_bazzite.txt
 
 # Dynamically set variables and execute skopeo within a single RUN command
