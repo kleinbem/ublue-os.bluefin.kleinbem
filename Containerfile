@@ -1,5 +1,6 @@
 # Stage 1: Context for all build-related files (scripts, configs, etc.)
-FROM scratch AS ctx
+# Using alpine:latest instead of scratch to provide a shell and basic utilities for RUN commands.
+FROM alpine:latest AS ctx
 
 # --- DEBUG START: Verify contents of build context ---
 RUN echo "--- DEBUG: Contents of / in ctx stage BEFORE COPY ---"
@@ -11,7 +12,8 @@ RUN echo "--- END DEBUG ---"
 # --- DEBUG END ---
 
 # Copy the entire contents of your local 'build_files' directory into /ctx_data/ in this stage.
-COPY build_files/ /ctx_data/ # Added trailing slash for source to specify directory contents
+COPY build_files/ /ctx_data/
+
 
 # --- DEBUG START: Verify contents AFTER COPY ---
 RUN echo "--- DEBUG: Contents of / in ctx stage AFTER COPY ---"
@@ -46,7 +48,7 @@ FROM fedora:latest AS akmods_extractor # Use a minimal fedora image with necessa
 RUN dnf install -y skopeo jq tar gzip rpm-build \
     && dnf clean all && rm -rf /var/cache/dnf
 
-# Copy the Bazzite kernel version from Stage 2.
+# Copy the BAZZITE_KERNEL_VERSION from the bazzite_kernel_info stage
 COPY --from=bazzite_kernel_info /tmp/kernel_version_bazzite.txt /tmp/kernel_version_bazzite.txt
 
 # Dynamically set variables and execute skopeo within a single RUN command
