@@ -1,18 +1,22 @@
 # Stage 1: Context for all build-related files (scripts, configs, etc.)
-# Using alpine:latest instead of scratch to provide a shell and basic utilities for RUN commands.
 FROM alpine:latest AS ctx
 
+# We need the GITHUB_WORKSPACE environment variable which holds the path to the repo.
+# This is injected by GitHub Actions, but we need to pass it into the build.
+ARG GITHUB_WORKSPACE="/home/runner/work/ublue-os.bluefin.kleinbem/ublue-os.bluefin.kleinbem"
+
 # --- DEBUG START: Verify contents of build context ---
-RUN echo "--- DEBUG: Contents of / in ctx stage BEFORE COPY ---"
-RUN ls -la /
-RUN echo "--- DEBUG: Contents of /build_files in build context BEFORE COPY ---"
-# This next command might fail if build_files doesn't exist at the root
-RUN ls -la /build_files/ || echo "Warning: /build_files/ does not exist at root of build context"
+RUN echo "--- DEBUG: GITHUB_WORKSPACE is ${GITHUB_WORKSPACE} ---"
+RUN echo "--- DEBUG: Contents of GITHUB_WORKSPACE ---"
+RUN ls -la "${GITHUB_WORKSPACE}" || echo "Error: GITHUB_WORKSPACE does not exist or is not readable."
+RUN echo "--- DEBUG: Contents of ${GITHUB_WORKSPACE}/build_files ---"
+RUN ls -la "${GITHUB_WORKSPACE}/build_files/" || echo "Error: build_files/ in GITHUB_WORKSPACE not found."
 RUN echo "--- END DEBUG ---"
 # --- DEBUG END ---
 
 # Copy the entire contents of your local 'build_files' directory into /ctx_data/ in this stage.
-COPY build_files/ /ctx_data/
+# Use absolute path from GITHUB_WORKSPACE as source.
+COPY "${GITHUB_WORKSPACE}/build_files/" /ctx_data/ # <-- ABSOLUTE SOURCE PATH HERE
 
 
 # --- DEBUG START: Verify contents AFTER COPY ---
@@ -33,8 +37,6 @@ FROM ghcr.io/ublue-os/bazzite:latest AS bazzite_kernel_info
 RUN KERNEL_VERSION_FOR_BAZZITE=$(uname -r) && echo "${KERNEL_VERSION_FOR_BAZZITE}" > /tmp/kernel_version_bazzite.txt
 
 # Attempt to find pre-existing .ko files within this base image.
-# Use || true to prevent stage failure if files aren't found.
-# These will be copied to /tmp/<filename> if found.
 RUN find /usr/lib/modules/ -name "binder_linux.ko" -exec cp {} /tmp/binder_linux.ko \; || true
 RUN find /usr/lib/modules/ -name "ashmem_linux.ko" -exec cp {} /tmp/ashmem_linux.ko \; || true
 
@@ -48,7 +50,7 @@ FROM fedora:latest AS akmods_extractor # Use a minimal fedora image with necessa
 RUN dnf install -y skopeo jq tar gzip rpm-build \
     && dnf clean all && rm -rf /var/cache/dnf
 
-# Copy the BAZZITE_KERNEL_VERSION from the bazzite_kernel_info stage
+# Copy the Bazzite kernel version from Stage 2.
 COPY --from=bazzite_kernel_info /tmp/kernel_version_bazzite.txt /tmp/kernel_version_bazzite.txt
 
 # Dynamically set variables and execute skopeo within a single RUN command
@@ -92,7 +94,7 @@ COPY --from=bazzite_module_source /tmp/ashmem_linux.ko /tmp/extracted_ashmem_lin
 COPY --from=ctx /ctx_data/anbox.conf /tmp/anbox.conf || true
 COPY --from=ctx /ctx_data/99-anbox.rules /tmp/99-anbox.rules || true
 
-# If not found directly, try from akmods_extractor stage (this will only add if they didn't exist before)
+# If not found directly, try from akmods_extractor stage
 COPY --from=akmods_extractor /final_extracted_modules/ashmem_linux.ko /tmp/extracted_ashmem_linux.ko || true
 COPY --from=akmods_extractor /final_extracted_modules/binder_linux.ko /tmp/extracted_binder_linux.ko || true
 
